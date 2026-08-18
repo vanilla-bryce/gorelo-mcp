@@ -1,0 +1,6 @@
+[
+ {"name":"gorelo_list_tickets","arguments":{"limit":12}},
+ {"name":"gorelo_list_tickets","arguments":{"status":"open","limit":1}},
+ {"name":"gorelo_list_tickets","arguments":{"status":"solved","limit":20}},
+ {"name":"gorelo_get_client","arguments":{"client":"16042","include_devices":true}}
+]

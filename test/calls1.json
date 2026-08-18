@@ -1,0 +1,12 @@
+[
+ {"name":"gorelo_list_tickets","arguments":{}},
+ {"name":"gorelo_list_tickets","arguments":{"status":"open","limit":8}},
+ {"name":"gorelo_list_tickets","arguments":{"status":"all","stale_days":60,"limit":6}},
+ {"name":"gorelo_list_tickets","arguments":{"search":"quote","status":"all","limit":6}},
+ {"name":"gorelo_search_clients","arguments":{"term":"welding,weha"}},
+ {"name":"gorelo_get_ticket","arguments":{"ticket":"G-13933"}},
+ {"name":"gorelo_get_contact","arguments":{"term":"rachel","limit":4}},
+ {"name":"gorelo_list_assets","arguments":{"stale_days":60,"limit":6}},
+ {"name":"gorelo_api_probe","arguments":{"path":"/v1/tickets/statuses","chars":600}},
+ {"name":"gorelo_add_ticket_comment","arguments":{"ticket":"G-13933","body":"test","confirm":true}}
+]

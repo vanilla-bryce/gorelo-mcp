@@ -1,0 +1,11 @@
+[
+ {"name":"gorelo_list_tickets","arguments":{"status":"open","limit":15}},
+ {"name":"gorelo_list_tickets","arguments":{"status":"solved","include_reasons":true,"limit":10}},
+ {"name":"gorelo_list_tickets","arguments":{"stale_days":100,"status":"all","limit":10}},
+ {"name":"gorelo_search_clients","arguments":{"term":"adventure,awx"}},
+ {"name":"gorelo_get_ticket","arguments":{"ticket":"G-1000"}},
+ {"name":"gorelo_get_client","arguments":{"client":"Northwind"}},
+ {"name":"gorelo_get_contact","arguments":{"term":"dana"}},
+ {"name":"gorelo_list_assets","arguments":{"stale_days":100,"limit":10}},
+ {"name":"gorelo_api_probe","arguments":{"path":"/v1/tickets/statuses","chars":600}}
+]

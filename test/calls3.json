@@ -1,0 +1,10 @@
+[
+ {"name":"gorelo_add_ticket_comment","arguments":{"ticket":"G-13933","body":"Intake review: this ticket has no agreed scope.","confirm":false}},
+ {"name":"gorelo_add_ticket_comment","arguments":{"ticket":"G-13933","body":"","confirm":true}},
+ {"name":"gorelo_add_ticket_comment","arguments":{"ticket":"G-99999","body":"nope","confirm":true}},
+ {"name":"gorelo_add_ticket_comment","arguments":{"ticket":"G-13933","body":"Intake review: this ticket has no agreed scope.","confirm":true}},
+ {"name":"gorelo_add_ticket_comment","arguments":{"ticket":"G-13933","body":"Intake review: this ticket has no agreed scope.","confirm":true}},
+ {"name":"gorelo_add_ticket_comment","arguments":{"ticket":"G-13933","body":"Second, different comment.","visibility":"client","confirm":true}},
+ {"name":"gorelo_api_probe","arguments":{"path":"/etc/passwd"}},
+ {"name":"gorelo_api_probe","arguments":{"path":"/v1/tickets","query":{"PageSize":1},"chars":300}}
+]
