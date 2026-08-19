@@ -152,43 +152,21 @@ module Gorelo
 
     GUID = /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i
 
-    # Gorelo can fetch a ticket by its GUID and by nothing else. There is no
-    # lookup by number and no search - Numbers, TicketNumbers, TicketNumber,
-    # Number, Search and SearchTerm are all silently ignored (same FilterHash
-    # as an unfiltered query). So a ticket number has to be resolved locally.
-    #
-    # The index is built from the two cheap sets that cover almost every real
-    # lookup: every unclosed ticket in the organisation, and every ticket you
-    # have ever led. Only if the number is in neither does it fall back to
-    # paging the whole table, and that happens at most once per process.
+    # `Query` is the documented search parameter: "Keyword matched against the
+    # ticket title, number and display number. Up to 200 characters."
+    # A GUID goes straight to /v1/tickets/{id}.
     def ticket_by_number(reference)
       key = reference.to_s.strip.sub(/\AG-/i, '')
       return nil if key.empty?
       return get("/v1/tickets/#{key}")['Data'] if key.match?(GUID)
 
-      hit = ticket_index[key]
-      return hit if hit
+      rows = Array(get('/v1/tickets', { 'Query' => key, 'PageSize' => 25 })['Data'])
 
-      unless @cache[:ticket_index_widened]
-        @cache[:ticket_index_widened] = true
-        @logger.call("ticket #{key} not in the open/mine index - paging all tickets once")
-        get_all('/v1/tickets').each { |t| ticket_index[t['Number'].to_s] ||= t }
-      end
-
-      ticket_index[key]
-    end
-
-    def ticket_index
-      @cache[:ticket_index] ||= begin
-        rows = get_all('/v1/tickets', { 'StatusIds' => unclosed_status_ids.join(',') })
-        begin
-          mine = resolve_user_id('me')
-          rows.concat(get_all('/v1/tickets', { 'LeadAssigneeIds' => mine.to_s }))
-        rescue Error
-          nil # no GORELO_MY_EMAIL configured - the unclosed set alone still works
-        end
-        rows.each_with_object({}) { |t, idx| idx[t['Number'].to_s] ||= t }
-      end
+      # Query matches titles as well as numbers, so prefer an exact number or
+      # display-number match before falling back to a single title hit.
+      rows.find { |t| t['Number'].to_s == key } ||
+        rows.find { |t| t['DisplayNumber'].to_s.casecmp?(reference.to_s.strip) } ||
+        (rows.size == 1 ? rows.first : nil)
     end
 
     def clients

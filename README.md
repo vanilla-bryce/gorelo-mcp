@@ -176,35 +176,49 @@ it excluded, and warns when a ticket carries a status the API didn't return from
 Confirmed working:
 
 ```
-/v1/tickets            LeadAssigneeIds, ClientIds, StatusIds, SortBy, SortOrder, PageSize, Cursor
-/v1/tickets/statuses
-/v1/tickets/{guid}
-/v1/tickets/{guid}/comments
+/v1/tickets                       GET, POST
+/v1/tickets/{id}                  GET
+/v1/tickets/{id}/comments         GET, POST   (oldest-first; ConversationType filter)
+/v1/tickets/{id}/comments/{id}    GET
+/v1/tickets/{id}/conversations    GET
+/v1/tickets/{id}/attachments      POST
+/v1/tickets/statuses | /tags | /types
 /v1/clients
-/v1/contacts           ClientId  (SINGULAR - ClientIds is ignored)
-/v1/assets/agents      no client filter at all
+/v1/contacts                      ClientId is SINGULAR here
+/v1/assets/agents                 no client filter
 /v1/organization/users
 ```
 
-**Parameters that are silently ignored** — they return the full unfiltered set rather than an
-error: `AssistingAssigneeIds`, `AssigneeIds`, `AssistingAssigneeId`, `WatcherIds`, `IsMerged`,
-`Numbers`, `TicketNumbers`, `TicketNumber`, `Number`, `Search`, `SearchTerm`, `IncludeDeleted`.
+**Gorelo publishes a full OpenAPI spec** — read it before guessing at parameter names:
+
+- Swagger UI: `https://api.aue.gorelo.io/swagger` (AU) · `https://api.usw.gorelo.io/swagger` (US)
+- Spec JSON: append `/v1/swagger.json`
+- Docs index built for LLMs: [help.gorelo.io/llms.txt](https://help.gorelo.io/llms.txt)
+
+`GET /v1/tickets` documents: `Query`, `StatusIds`, `ClientIds`, `PriorityIds`, `TypeIds`,
+`LeadAssigneeIds`, `ContactIds`, `TagIds`, `GroupIds`, `UpdatedSince`, `UpdatedBefore`,
+`CreatedSince`, `CreatedBefore`, `SortBy`, `SortOrder`, `PageSize`, `Cursor`.
+
+⚠️ **Unknown query parameters are ignored, not rejected.** A misspelled or invented filter
+returns HTTP 200 and the full unfiltered set, which looks exactly like a working call. Check
+the spec rather than trying names.
 
 Three consequences worth knowing:
 
-**There is no search and no lookup by ticket number.** A ticket can only be fetched by GUID,
-which the list endpoint doesn't show. So `gorelo_get_ticket` resolves numbers locally against
-an index of your unclosed and led tickets, and only pages the whole table if it must.
+**There is no assisting-assignee filter.** `LeadAssigneeIds` is the only assignment filter in
+the spec; `AssistingAssigneeIds` and `WatcherIds` are response fields only. Gorelo's own UI
+counts you as lead *or* assisting, so this server sweeps the organisation's unclosed tickets to
+match — usually one page, one request. Pass `include_assisting: false` to skip it.
 
-**`LeadAssigneeIds` is the only assignment filter.** Gorelo's own UI counts you as lead *or*
-assisting, so assisting tickets are found by sweeping the organisation's unclosed tickets —
-usually one page, one request. Pass `include_assisting: false` to skip it.
+**`Query` searches title, number and display number** (200 characters max), which is how a
+ticket number is resolved to the GUID that `/v1/tickets/{id}` needs.
 
-**Deleted comments are still returned by the API**, with no flag to identify them, while the
-web UI correctly shows *"This comment has been deleted"*. Reported to Gorelo. This server
-withholds the body of any comment that carries a deletion flag, so it will do the right thing
-if and when one appears — but until then, **treat comment history as potentially including
-retracted content.**
+**Deleted comments are still returned by the API**, with their body intact. The comment schema
+contains no deletion, removal or visibility property at all, so a consumer cannot tell — while
+the web UI correctly shows *"This comment has been deleted"*. Reported to Gorelo. This server
+withholds the body of any comment carrying a deletion flag, so it will do the right thing if
+one ever appears; until then, **treat comment history as potentially including retracted
+content**, and never rely on deleting a comment to remove sensitive data.
 
 ### Two tricks worth stealing
 

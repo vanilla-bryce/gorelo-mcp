@@ -13,10 +13,12 @@ break things:
   * PageSize clamped to 1..200
   * /v1/tickets/statuses does NOT list the "Merged" status, even though
     tickets use it
-  * only LeadAssigneeIds filters; AssistingAssigneeIds, AssigneeIds and
-    WatcherIds are accepted and silently ignored
-  * no lookup by ticket number and no search: Numbers, TicketNumbers, Number,
-    Search and SearchTerm are all ignored
+  * LeadAssigneeIds filters, but there is no assisting-assignee filter:
+    AssistingAssigneeIds, AssigneeIds and WatcherIds are response fields only,
+    and are accepted then silently ignored as query parameters
+  * `Query` is the search parameter, matching title, number and display number
+  * unknown query parameters are ignored rather than rejected, so a wrong
+    name looks like a successful call that returns everything
   * 429 rate limiting with a retry_after
 
 Run it:  python3 mock_gorelo.py        (listens on 127.0.0.1:8899)
@@ -347,11 +349,18 @@ class Handler(BaseHTTPRequestHandler):
             if "ClientIds" in q:
                 want = set(q["ClientIds"][0].split(","))
                 rows = [t for t in rows if str(t["ClientId"]) in want]
+            if "Query" in q:
+                # Documented: matches title, number and display number.
+                needle = q["Query"][0].lower()
+                rows = [t for t in rows
+                        if needle in t["Title"].lower()
+                        or needle == str(t["Number"])
+                        or needle == t["DisplayNumber"].lower()]
             if "StatusIds" in q:
                 want = set(q["StatusIds"][0].split(","))
                 rows = [t for t in rows if str(t["Status"]["Id"]) in want]
-            # AssistingAssigneeIds, AssigneeIds, WatcherIds, Numbers, Search and
-            # friends are accepted and ignored, exactly as the real API does.
+            # AssistingAssigneeIds, AssigneeIds and WatcherIds are response
+            # fields, not filters: accepted and ignored, as the real API does.
             rows, pag = paginate(rows, q)
             return self.reply(200, env(rows, pag))
 

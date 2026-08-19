@@ -123,7 +123,7 @@ module GoreloTools
           assignee:   { type: 'string', description: 'Gorelo user id, email, name fragment, or "me". Use "anyone" for no assignee filter. Default "me".' },
           status:     { type: 'string', enum: %w[active solved closed open all], description: 'Default "active".' },
           client:     { type: 'string', description: 'Client name fragment or id. Comma-separate several terms.' },
-          search:     { type: 'string', description: 'Case-insensitive substring match on the ticket title.' },
+          search:     { type: 'string', description: 'Keyword matched by Gorelo against the ticket title, number and display number.' },
           stale_days: { type: 'integer', description: 'Only tickets not updated for at least this many days.' },
           include_reasons: { type: 'boolean', description: 'Show the status reason under each row. Gorelo collects one whenever a ticket moves to Billing, On Hold, Scheduled or either Waiting status - it is usually the note saying what still has to happen.' },
           include_assisting: { type: 'boolean', description: 'Also include unclosed tickets where you are an assisting assignee, matching what the Gorelo UI counts. Default true. Costs one extra request.' },
@@ -143,6 +143,13 @@ module GoreloTools
         uid = api.resolve_user_id(assignee)
         query['LeadAssigneeIds'] = uid.to_s
         scope << "assignee=#{assignee}"
+      end
+
+      if args['search'] && !args['search'].to_s.empty?
+        # Documented server-side search. Matches title, number and display
+        # number; capped at 200 characters by the API.
+        query['Query'] = args['search'].to_s[0, 200]
+        scope << "search=#{args['search']}"
       end
 
       if args['client'] && !args['client'].to_s.empty?
@@ -212,11 +219,6 @@ module GoreloTools
         base.nil? ? status != 'closed' : wanted.include?(base)
       end
       selected.reject! { |t| merged?(t) }
-
-      if args['search'] && !args['search'].to_s.empty?
-        needle = args['search'].to_s.downcase
-        selected.select! { |t| t['Title'].to_s.downcase.include?(needle) }
-      end
 
       if args['stale_days']
         n = args['stale_days'].to_i
@@ -580,6 +582,13 @@ module GoreloTools
       limit  = (args['limit'] || 50).to_i.clamp(1, 500)
       agents = api.get_all('/v1/assets/agents')
       rows   = agents
+
+      if args['search'] && !args['search'].to_s.empty?
+        # Documented server-side search. Matches title, number and display
+        # number; capped at 200 characters by the API.
+        query['Query'] = args['search'].to_s[0, 200]
+        scope << "search=#{args['search']}"
+      end
 
       if args['client'] && !args['client'].to_s.empty?
         matched = api.resolve_clients(args['client'])
