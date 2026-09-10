@@ -1,0 +1,8 @@
+# Your API key lives here. Never commit it.
+.env
+
+# Written by the test driver
+test/_tmp_home/
+
+# Write-idempotency log, if it ever lands in the project folder
+.gorelo-mcp-writes.jsonl

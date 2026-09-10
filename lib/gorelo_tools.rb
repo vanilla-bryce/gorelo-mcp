@@ -87,7 +87,11 @@ module GoreloTools
     get_client(server, api)
     get_contact(server, api)
     list_assets(server, api)
+    billing_review(server, api)
+    time_report(server, api)
+    response_report(server, api)
     add_ticket_comment(server, api)
+    update_ticket(server, api)
     api_probe(server, api)
   end
 
@@ -306,6 +310,23 @@ module GoreloTools
              'ticket you lead, and then the whole table. Check the number.'
       end
 
+      # find_ticket resolves a number through the LIST endpoint, and a list row
+      # is deliberately thinner than the get-by-id: no Description, no Time, no
+      # Products, no linked assets. Re-fetch by id so this tool always renders
+      # the full record regardless of how the ticket was found.
+      #
+      # Best-effort: a tenant that has not had the 2026-08-21 update, or a
+      # transient failure, must still produce the ticket rather than an error.
+      if t['Id']
+        begin
+          detail = api.get("/v1/tickets/#{t['Id']}")['Data']
+          t = t.merge(detail) if detail.is_a?(Hash)
+        rescue Gorelo::Error => e
+          api_log = "could not fetch the full ticket detail (#{e.message.lines.first.to_s.strip})"
+          t['_detail_warning'] = api_log
+        end
+      end
+
       out = []
       out << "#{t['DisplayNumber'] || "G-#{t['Number']}"}  #{t['Title']}"
       out << ('=' * 78)
@@ -321,10 +342,51 @@ module GoreloTools
       out << "Updated     #{t['UpdatedOn']}  (#{days_since(t['UpdatedOn'])} days ago)"
       out << "In status   since #{t['StatusUpdatedOn']} (#{days_since(t['StatusUpdatedOn'])} days)"
       out << "Closed      #{t['ClosedOn']}" if t['ClosedOn']
-      out << 'Awaiting client: YES - Gorelo believes the ball is in their court' if t['IsAwaitingClient']
+      # Renamed from IsAwaitingClient in the 2026-08-21 API release. The old
+      # name is still read so this works against a tenant on either version -
+      # and because a renamed boolean fails SILENTLY: the flag simply never
+      # shows, and nothing tells you the ticket is sitting with the client.
+      if t['IsWaitingOnThem'] || t['IsAwaitingClient']
+        out << 'Waiting on them: YES - Gorelo believes the ball is in their court'
+      end
       out << "MERGED into #{t['MergedIntoTicketId']}" if t['IsMerged']
       out << "Last update #{nested(t, 'LastUpdate', 'UpdateType')}: #{nested(t, 'LastUpdate', 'Summary')}"
       out << "Ticket id   #{t['Id']}"
+
+      # NEW in the 2026-08-21 release: GET /v1/tickets/{id} returns a time and
+      # billing breakdown. Before it, nothing about time was reachable through
+      # the API at all, and "was this ticket ever billed?" could only be
+      # answered inside Gorelo's UI.
+      #
+      # The distinction that matters: ActualHours is what was recorded,
+      # AdjustedHours is what will be invoiced. A ticket sitting in Billing with
+      # ActualHours of 0 was never time-recorded - which is a different problem
+      # from one with hours that simply have not been invoiced yet.
+      out << "⚠ #{t['_detail_warning']}" if t['_detail_warning']
+
+      if (time = t['Time'])
+        actual   = time['ActualHours'].to_f
+        adjusted = time['AdjustedHours'].to_f
+        billable = nested(time, 'Breakdown', 'Billable', 'AdjustedHours').to_f
+        nonbill  = nested(time, 'Breakdown', 'NotBillable', 'AdjustedHours').to_f +
+                   nested(time, 'Breakdown', 'NotBillableHidden', 'AdjustedHours').to_f
+
+        out << ''
+        out << format('Time        %.2fh recorded, %.2fh to invoice  (billable %.2fh, ' \
+                      'not billable %.2fh)', actual, adjusted, billable, nonbill)
+        if actual.zero?
+          out << '            ⚠ NO TIME RECORDED on this ticket.'
+        elsif billable.zero? && adjusted.positive?
+          out << '            ⚠ time recorded but NONE of it is billable.'
+        end
+        if (products = t['Products']) && products['Count'].to_i.positive?
+          out << format('Products    %d line(s), %.2f', products['Count'].to_i,
+                        products['TotalAmount'].to_f)
+        end
+        if (override = t['BillingOverride']) && override.values.any? { |v| !v.nil? }
+          out << "Billing     override set: #{override.reject { |_, v| v.nil? }.inspect}"
+        end
+      end
 
       if args.fetch('include_comments', true)
         out << ''
@@ -487,7 +549,12 @@ module GoreloTools
       end
 
       if args.fetch('include_devices', true)
-        agents = api.get_all('/v1/assets/agents')
+        # Server-side since the 2026-08-21 release. The local select is kept as
+        # a belt-and-braces filter: if a tenant has not had the update yet,
+        # ClientIds is silently ignored and the full fleet comes back, which
+        # would otherwise report every device in the organisation as this
+        # client's.
+        agents = api.get_all('/v1/assets/agents', { 'ClientIds' => ids.join(',') })
         want   = ids.map(&:to_s)
         mine   = agents.select do |a|
           [a['ClientId'], nested(a, 'Client', 'Id'), a['CompanyId'], a['OrganizationId']]
@@ -565,41 +632,40 @@ module GoreloTools
     server.tool(
       name:  'gorelo_list_assets',
       title: 'List Gorelo managed devices',
-      description: 'Managed agents/devices. Optionally narrowed to a client or a name fragment, ' \
-                   'or filtered to devices not seen for N days - the fastest way to find agents ' \
-                   'still billing for a client who left.',
+      description: 'Managed agents/devices. Narrow by client, by any text on the record, or to ' \
+                   'devices not seen for N days - the fastest way to find agents still billing ' \
+                   'for a client who left. Shows the Description and warranty/term end date ' \
+                   'under each row, which is where reportable notes have to live because Gorelo ' \
+                   'does not expose asset TAGS through the API at all.',
       input_schema: {
         type: 'object',
         properties: {
           client:        { type: 'string', description: 'Client name fragment or id.' },
-          search:        { type: 'string', description: 'Device name fragment.' },
+          search:        { type: 'string', description: 'Matched against every field on the asset, including Description - so notes written there (e.g. a rental ContractEnd date) are searchable.' },
           stale_days:    { type: 'integer', description: 'Only devices not seen for at least this many days.' },
           limit:         { type: 'integer', description: 'Default 50.' }
         },
         additionalProperties: false
       }
     ) do |args|
-      limit  = (args['limit'] || 50).to_i.clamp(1, 500)
-      agents = api.get_all('/v1/assets/agents')
-      rows   = agents
+      limit = (args['limit'] || 50).to_i.clamp(1, 500)
 
-      if args['search'] && !args['search'].to_s.empty?
-        # Documented server-side search. Matches title, number and display
-        # number; capped at 200 characters by the API.
-        query['Query'] = args['search'].to_s[0, 200]
-        scope << "search=#{args['search']}"
-      end
-
+      # The 2026-08-21 release added ClientIds filtering to /v1/assets/agents.
+      # Before it, this paged the entire fleet - 626 devices on a real tenant -
+      # to show four. Verified applied, not ignored: the response FilterHash
+      # differs from the unfiltered one and TotalCount drops accordingly.
+      query = {}
+      scope = nil
       if args['client'] && !args['client'].to_s.empty?
         matched = api.resolve_clients(args['client'])
         next "No client matches #{args['client'].inspect}." if matched.empty?
 
-        want = matched.map { |c| c['Id'].to_s }
-        rows = rows.select do |a|
-          [a['ClientId'], nested(a, 'Client', 'Id'), a['CompanyId'], a['OrganizationId']]
-            .compact.map(&:to_s).any? { |v| want.include?(v) }
-        end
+        query['ClientIds'] = matched.map { |c| c['Id'] }.join(',')
+        scope = matched.map { |c| c['Name'] }.first(3).join(' + ')
       end
+
+      agents = api.get_all('/v1/assets/agents', query)
+      rows   = agents
 
       if args['search'] && !args['search'].to_s.empty?
         needle = args['search'].to_s.downcase
@@ -615,23 +681,543 @@ module GoreloTools
 
       rows = rows.sort_by { |a| -(days_since(seen_of.call(a)) || 9_999) }
 
-      out = ["#{rows.size} of #{agents.size} devices match.", '']
+      header = "#{rows.size} of #{agents.size} devices match"
+      header += " (client=#{scope})" if scope
+      out = ["#{header}.", '']
       out << "#{pad('Device', 26)}#{pad('Client', 26)}#{pad('OS', 28)}last seen"
       out << ('-' * 92)
       rows.first(limit).each do |a|
         cid = a['ClientId'] || nested(a, 'Client', 'Id') || a['CompanyId']
         out << "#{pad(a['Name'] || a['HostName'] || a['ComputerName'] || a['Id'], 26)}" \
                "#{pad(api.client_name(cid) || cid, 26)}" \
-               "#{pad(a['OperatingSystem'] || nested(a, 'Os', 'Name'), 28)}#{age(seen_of.call(a))} ago"
+               "#{pad(a['OsName'] || a['OperatingSystem'] || nested(a, 'Os', 'Name'), 28)}" \
+               "#{age(seen_of.call(a))} ago"
+
+        # Description and the warranty dates are the only writable fields the
+        # asset API exposes. Gorelo's asset TAGS are not in the API at all, so
+        # anything that has to be reportable - a rental contract end date, for
+        # instance - has to live in one of these.
+        #
+        # The 2026-08-21 release split WarrantyExpiryDate into WarrantyStartDate
+        # and WarrantyEndDate. The old name is still read, so this works against
+        # a tenant on either version. Worth noting how this one failed: the
+        # renamed field simply vanished from the output with no error at all,
+        # which for a field carrying rental contract end dates is the quiet kind
+        # of wrong.
+        notes = []
+        notes << a['Description'].to_s.strip unless a['Description'].to_s.strip.empty?
+        warranty_end = a['WarrantyEndDate'] || a['WarrantyExpiryDate']
+        notes << "warranty/term ends #{warranty_end}" if warranty_end
+        out << "#{' ' * 4}\u21B3 #{clip(notes.join(' · '), 100)}" unless notes.empty?
       end
       out << "#{rows.size - limit} more not shown." if rows.size > limit
       out.join("\n")
     end
   end
 
-  # ---- 7. add ticket comment (the only write) -----------------------------
 
-  COMMENT_POST_PATHS = %w[comments notes conversations].freeze
+  # ---- 7. billing review --------------------------------------------------
+
+  # Only possible since the 2026-08-21 release, which put a time and billing
+  # breakdown on GET /v1/tickets/{id}. Before it, "does this ticket have hours
+  # on it?" could not be answered outside Gorelo's UI, so a Billing queue was
+  # an undifferentiated pile.
+  #
+  # The split this produces is the point. A ticket with billable hours needs
+  # an invoice. A ticket with NO hours is almost always a recurring charge that
+  # was never set up - a different job, for a different person, that loses its
+  # monthly value every month rather than once. From outside the ticket the two
+  # look identical.
+  def billing_review(server, api)
+    server.tool(
+      name:  'gorelo_billing_review',
+      title: 'Review the Billing queue with recorded time',
+      description: <<~TEXT,
+        Every ticket in a given status, with its recorded hours, split into what can be
+        invoiced and what cannot. Sorted longest-waiting first.
+
+        Splits the queue three ways:
+          - BILLABLE HOURS - ready to invoice now
+          - TIME BUT NONE BILLABLE - in the queue for some other reason
+          - NO TIME RECORDED - almost always a recurring charge never set up
+
+        COST: one request per ticket, because the time breakdown only exists on the
+        get-by-id endpoint and not on list rows. The reply states how many it made.
+      TEXT
+      input_schema: {
+        type: 'object',
+        properties: {
+          status:   { type: 'string', description: 'Status NAME to review, matched as a fragment. Default "Billing". Use "solved" to sweep the whole solved base.' },
+          assignee: { type: 'string', description: 'Gorelo user id, email, name fragment, or "me". Default "anyone".' },
+          min_days: { type: 'integer', description: 'Only tickets in that status for at least this many days. Default 0.' },
+          limit:    { type: 'integer', description: 'Max tickets to inspect. Default 25 - and each one costs a request.' }
+        },
+        additionalProperties: false
+      }
+    ) do |args|
+      wanted   = (args['status'] || 'Billing').to_s.downcase
+      limit    = (args['limit'] || 25).to_i.clamp(1, 100)
+      min_days = (args['min_days'] || 0).to_i
+
+      ids = if wanted == 'solved'
+              api.statuses.values.select { |st| st['BaseStatusId'] == Gorelo::BASE_SOLVED }
+            else
+              api.statuses.values.select { |st| st['Name'].to_s.downcase.include?(wanted) }
+            end
+      if ids.empty?
+        next "No Gorelo status matches #{args['status'].inspect}. Statuses: " \
+             "#{api.statuses.values.map { |st| st['Name'] }.join(', ')}"
+      end
+
+      query = { 'StatusIds' => ids.map { |st| st['Id'] }.join(',') }
+      assignee = args['assignee'] || 'anyone'
+      unless assignee.to_s.downcase == 'anyone'
+        query['LeadAssigneeIds'] = api.resolve_user_id(assignee).to_s
+      end
+
+      rows = api.get_all('/v1/tickets', query)
+               .reject { |t| merged?(t) }
+               .select { |t| (days_since(t['StatusUpdatedOn']) || 0) >= min_days }
+               .sort_by { |t| -(days_since(t['StatusUpdatedOn']) || 0) }
+
+      if rows.empty?
+        next "No tickets in #{ids.map { |st| st['Name'] }.join('/')}" \
+             "#{min_days.positive? ? " for #{min_days}+ days" : ''}."
+      end
+
+      inspected = rows.first(limit)
+      calls     = 0
+      billable  = []
+      unbillable = []
+      untimed   = []
+
+      inspected.each do |t|
+        detail = begin
+          calls += 1
+          api.get("/v1/tickets/#{t['Id']}")['Data']
+        rescue Gorelo::Error
+          nil
+        end
+        full = detail.is_a?(Hash) ? t.merge(detail) : t
+        time = full['Time'] || {}
+        b    = nested(time, 'Breakdown', 'Billable', 'AdjustedHours').to_f
+        act  = time['ActualHours'].to_f
+
+        if b.positive?      then billable << [full, act, b]
+        elsif act.positive? then unbillable << [full, act, b]
+        else                     untimed << [full, act, b]
+        end
+      end
+
+      line = lambda do |full, act, b|
+        num    = full['DisplayNumber'] || "G-#{full['Number']}"
+        client = api.client_name(full['ClientId']) || (full['ClientId'] ? "client #{full['ClientId']}" : '⚠ NO CLIENT')
+        days   = days_since(full['StatusUpdatedOn'])
+        row    = "#{pad(num, 10)}#{pad(client, 30)}#{format('%5dd', days || 0)}  " \
+                 "#{format('%5.2fh rec / %5.2fh billable', act, b)}  #{clip(full['Title'], 44)}"
+        extra  = []
+        if (r = status_reason(full)) then extra << r end
+        if (pr = full['Products']) && pr['Count'].to_i.positive?
+          extra << "#{pr['Count']} product line(s), #{format('%.2f', pr['TotalAmount'].to_f)}"
+        end
+        extra.empty? ? row : "#{row}\n#{' ' * 12}\u21B3 #{clip(extra.join(' · '), 96)}"
+      end
+
+      out = ["#{rows.size} ticket(s) in #{ids.map { |st| st['Name'] }.join('/')}" \
+             "#{min_days.positive? ? " for #{min_days}+ days" : ''}. " \
+             "Inspected #{inspected.size} (#{calls} extra request(s) for the time breakdown)."]
+      out << ''
+
+      total_billable = billable.sum { |(_, _, b)| b }
+      out << "READY TO INVOICE - #{billable.size} ticket(s), #{format('%.2f', total_billable)}h billable"
+      out << ('-' * 118)
+      billable.each { |a| out << line.call(*a) }
+      out << '  (none)' if billable.empty?
+
+      out << ''
+      out << "TIME RECORDED BUT NONE BILLABLE - #{unbillable.size} ticket(s)"
+      out << 'These are in the queue for some other reason - a recurring charge, or an invoice'
+      out << 'raised in another system. Worth re-filing so the queue means one thing.'
+      out << ('-' * 118)
+      unbillable.each { |a| out << line.call(*a) }
+      out << '  (none)' if unbillable.empty?
+
+      out << ''
+      out << "NO TIME RECORDED - #{untimed.size} ticket(s)"
+      out << 'Almost always a recurring charge that was never set up. These lose their monthly'
+      out << 'value every month, not once, so they usually outrank the invoicing above.'
+      out << ('-' * 118)
+      untimed.each { |a| out << line.call(*a) }
+      out << '  (none)' if untimed.empty?
+
+      if rows.size > inspected.size
+        out << ''
+        out << "#{rows.size - inspected.size} more not inspected - raise limit to include them."
+      end
+      out.join("\n")
+    end
+  end
+
+
+  # ---- 8. time report -----------------------------------------------------
+
+  # WHAT THIS CANNOT DO, stated up front because it shapes everything below:
+  # Gorelo's API has NO time-entry endpoint. The whole public surface is
+  # fourteen paths and none of them expose a timesheet, a work entry, or hours
+  # by user. Confirmed against the OpenAPI spec, not inferred from a 404.
+  #
+  # The only time data that exists is a per-TICKET total on
+  # GET /v1/tickets/{id}, added 2026-08-21. So "technician time" here means
+  # ticket hours attributed to each ticket's LEAD ASSIGNEE - which counts an
+  # assisting technician's hours against the lead. That is a real limitation,
+  # not a rounding error, and the report says so every time rather than
+  # presenting an approximation as a measurement.
+  #
+  # What it IS good for: realisation - what fraction of recorded hours are
+  # billable - which is a ratio, and survives the attribution problem far
+  # better than a per-person total does.
+  def time_report(server, api)
+    server.tool(
+      name:  'gorelo_time_report',
+      title: 'Report recorded time and realisation',
+      description: <<~TEXT,
+        Recorded hours, invoiceable hours and the billable share, over a window, grouped by
+        technician or client.
+
+        ⚠ Gorelo has NO per-user time API - the entire spec is 14 paths and none expose
+        timesheets. Hours are per TICKET and are attributed here to the ticket's LEAD
+        assignee, so an assisting technician's time counts against the lead. The reply
+        states how many tickets that affects. Treat per-person totals as indicative and
+        the REALISATION percentage as the reliable number.
+
+        COST AND TIME: one request per ticket, because the breakdown exists only on the
+        get-by-id endpoint. 500+ tickets are updated org-wide in a typical month, so scope
+        it - by assignee, by client, or with a short window - and expect roughly a second
+        per ticket. The reply states the request count.
+      TEXT
+      input_schema: {
+        type: 'object',
+        properties: {
+          days:     { type: 'integer', description: 'Window in days, matched on the ticket UpdatedOn date. Default 30.' },
+          assignee: { type: 'string', description: 'Gorelo user id, email, name fragment, or "me". Use "anyone" to cover the organisation. Default "me".' },
+          client:   { type: 'string', description: 'Restrict to one or more clients (name fragment, comma-separated).' },
+          group_by: { type: 'string', enum: %w[technician client], description: 'Default "client" for one technician, "technician" for "anyone".' },
+          limit:    { type: 'integer', description: 'Max tickets to inspect - each costs a request. Default 150.' }
+        },
+        additionalProperties: false
+      }
+    ) do |args|
+      days  = (args['days'] || 30).to_i.clamp(1, 400)
+      limit = (args['limit'] || 150).to_i.clamp(1, 400)
+      since = (Time.now.utc - (days * 86_400)).strftime('%Y-%m-%d')
+
+      query    = { 'UpdatedSince' => since }
+      scope    = ["last #{days}d"]
+      assignee = args['assignee'] || 'me'
+      org_wide = assignee.to_s.downcase == 'anyone'
+
+      unless org_wide
+        query['LeadAssigneeIds'] = api.resolve_user_id(assignee).to_s
+        scope << "assignee=#{assignee}"
+      end
+
+      if args['client'] && !args['client'].to_s.empty?
+        matched = api.resolve_clients(args['client'])
+        next "No client matches #{args['client'].inspect}." if matched.empty?
+
+        query['ClientIds'] = matched.map { |c| c['Id'] }.join(',')
+        scope << "client=#{matched.map { |c| c['Name'] }.first(3).join(' + ')}"
+      end
+
+      rows = api.get_all('/v1/tickets', query).reject { |t| merged?(t) }
+      if rows.empty?
+        next "No tickets #{scope.join(', ')}."
+      end
+
+      inspected  = rows.first(limit)
+      with_assist = inspected.count { |t| Array(t['AssistingAssigneeIds']).any? }
+      calls = 0
+      buckets = Hash.new { |h, k| h[k] = { actual: 0.0, adjusted: 0.0, billable: 0.0, tickets: 0 } }
+      totals  = { actual: 0.0, adjusted: 0.0, billable: 0.0 }
+      biggest = []
+
+      group_by = args['group_by'] || (org_wide ? 'technician' : 'client')
+
+      inspected.each_with_index do |t, i|
+        server.log("time report: #{i + 1}/#{inspected.size} tickets inspected") if ((i + 1) % 25).zero?
+        detail = begin
+          calls += 1
+          api.get("/v1/tickets/#{t['Id']}")['Data']
+        rescue Gorelo::Error
+          nil
+        end
+        next unless detail.is_a?(Hash)
+
+        time = detail['Time'] || {}
+        act  = time['ActualHours'].to_f
+        adj  = time['AdjustedHours'].to_f
+        bil  = nested(time, 'Breakdown', 'Billable', 'AdjustedHours').to_f
+        next if act.zero? && adj.zero?
+
+        key = if group_by == 'technician'
+                api.user_name(t['LeadAssigneeId']) || "user #{t['LeadAssigneeId']}"
+              else
+                api.client_name(t['ClientId']) || (t['ClientId'] ? "client #{t['ClientId']}" : '⚠ NO CLIENT')
+              end
+        b = buckets[key]
+        b[:actual] += act
+        b[:adjusted] += adj
+        b[:billable] += bil
+        b[:tickets] += 1
+        totals[:actual] += act
+        totals[:adjusted] += adj
+        totals[:billable] += bil
+        biggest << [t, act, adj, bil]
+      end
+
+      pct = lambda do |part, whole|
+        whole.zero? ? '   -' : format('%3d%%', ((part / whole) * 100).round)
+      end
+
+      out = ["Recorded time - #{scope.join(', ')}."]
+      out << "#{rows.size} ticket(s) in scope, #{inspected.size} inspected " \
+             "(#{calls} extra request(s) for the time breakdown); " \
+             "#{buckets.values.sum { |b| b[:tickets] }} of them carry time."
+      out << ''
+      out << '⚠ Gorelo has no per-user time API. Hours are attributed to each ticket\'s LEAD'
+      out << "  assignee. #{with_assist} of the inspected tickets also have assisting assignees, so"
+      out << '  those hours are counted against the lead. Per-person totals are indicative;'
+      out << '  the realisation percentage is the number to trust.'
+      out << ''
+      out << format('TOTAL   %7.2fh recorded   %7.2fh to invoice   %7.2fh billable   ' \
+                    'realisation %s',
+                    totals[:actual], totals[:adjusted], totals[:billable],
+                    pct.call(totals[:billable], totals[:adjusted]))
+      if totals[:adjusted] > totals[:actual]
+        out << format('        adjusted UP by %.2fh across the window', totals[:adjusted] - totals[:actual])
+      elsif totals[:actual] > totals[:adjusted]
+        out << format('        written DOWN by %.2fh across the window', totals[:actual] - totals[:adjusted])
+      end
+
+      out << ''
+      out << "By #{group_by}"
+      out << "#{'Tkts'.rjust(5)}#{'Recorded'.rjust(11)}#{'Invoice'.rjust(11)}" \
+             "#{'Billable'.rjust(11)}#{'Real.'.rjust(7)}  #{group_by.capitalize}"
+      out << ('-' * 96)
+      buckets.sort_by { |_, b| -b[:adjusted] }.each do |name, b|
+        out << "#{b[:tickets].to_s.rjust(5)}#{format('%10.2fh', b[:actual])}" \
+               "#{format('%10.2fh', b[:adjusted])}#{format('%10.2fh', b[:billable])}" \
+               "#{pct.call(b[:billable], b[:adjusted]).rjust(7)}  #{clip(name, 44)}"
+      end
+
+      # Non-billable hours are where the margin actually goes, so name the
+      # worst offenders rather than leaving them inside a percentage.
+      leak = biggest.select { |(_, _, adj, bil)| adj - bil > 0.25 }
+                    .sort_by { |(_, _, adj, bil)| -(adj - bil) }
+      if leak.any?
+        lost = leak.sum { |(_, _, adj, bil)| adj - bil }
+        out << ''
+        out << format('NON-BILLABLE - %.2fh across %d ticket(s), largest first', lost, leak.size)
+        out << ('-' * 96)
+        leak.first(12).each do |(t, _act, adj, bil)|
+          out << "#{pad(t['DisplayNumber'] || "G-#{t['Number']}", 10)}" \
+                 "#{pad(api.client_name(t['ClientId']) || '?', 28)}" \
+                 "#{format('%6.2fh', adj - bil)}  #{clip(t['Title'], 48)}"
+        end
+        out << "  … #{leak.size - 12} more" if leak.size > 12
+      end
+
+      if rows.size > inspected.size
+        out << ''
+        out << "⚠ #{rows.size - inspected.size} ticket(s) in scope were NOT inspected (limit " \
+               "#{limit}). Every figure above covers only the #{inspected.size} that were."
+      end
+      out.join("\n")
+    end
+  end
+
+
+  # ---- 9. first-response report -------------------------------------------
+
+  # Sla.FirstResponse.ElapsedBusinessMinutes is on every LIST row, so unlike
+  # the time report this costs no extra requests at all - hundreds of tickets
+  # in one or two calls. The field was renamed on 2026-08-21 (it was a flat
+  # "SLA Minutes"), which is why nothing used it before.
+  #
+  # BUSINESS minutes, not wall clock: the figure already excludes nights and
+  # weekends. A ticket raised at 4:55pm and answered at 9:05am is a few
+  # minutes here, not seventeen hours, and reporting it as elapsed time would
+  # make the team look far worse than it is.
+  def response_report(server, api)
+    server.tool(
+      name:  'gorelo_response_report',
+      title: 'First-response times',
+      description: <<~TEXT,
+        How long tickets wait for their first response, grouped by technician, client or
+        group/brand. Median, 90th percentile and worst, plus the share answered within
+        target.
+
+        Costs NO extra requests - the SLA figure rides on the ticket list - so this runs
+        over hundreds of tickets in seconds, unlike gorelo_time_report.
+
+        The figures are BUSINESS minutes: nights and weekends are already excluded, so a
+        ticket raised at 4:55pm and answered at 9:05am counts as a few minutes, not
+        seventeen hours.
+
+        Tickets with NO first-response record are counted and reported separately rather
+        than dropped - they are usually tickets a technician raised themselves, and
+        silently excluding them flatters every other number.
+      TEXT
+      input_schema: {
+        type: 'object',
+        properties: {
+          days:           { type: 'integer', description: 'Window in days, on ticket creation date. Default 30.' },
+          assignee:       { type: 'string', description: 'Gorelo user id, email, name fragment, or "me". Use "anyone" for the organisation. Default "anyone".' },
+          client:         { type: 'string', description: 'Restrict to one or more clients (name fragment, comma-separated).' },
+          group_by:       { type: 'string', enum: %w[technician client group], description: 'Default "technician". "group" splits by Gorelo group, which is how separate desks or brands are modelled.' },
+          target_minutes: { type: 'integer', description: 'First-response target in BUSINESS minutes. Default 60.' },
+          limit:          { type: 'integer', description: 'Max groups shown. Default 20.' }
+        },
+        additionalProperties: false
+      }
+    ) do |args|
+      days    = (args['days'] || 30).to_i.clamp(1, 400)
+      target  = (args['target_minutes'] || 60).to_i.clamp(1, 10_000)
+      limit   = (args['limit'] || 20).to_i.clamp(1, 100)
+      since   = (Time.now.utc - (days * 86_400)).strftime('%Y-%m-%d')
+      query   = { 'CreatedSince' => since }
+      scope   = ["last #{days}d"]
+
+      assignee = args['assignee'] || 'anyone'
+      unless assignee.to_s.downcase == 'anyone'
+        query['LeadAssigneeIds'] = api.resolve_user_id(assignee).to_s
+        scope << "assignee=#{assignee}"
+      end
+
+      if args['client'] && !args['client'].to_s.empty?
+        matched = api.resolve_clients(args['client'])
+        next "No client matches #{args['client'].inspect}." if matched.empty?
+
+        query['ClientIds'] = matched.map { |c| c['Id'] }.join(',')
+        scope << "client=#{matched.map { |c| c['Name'] }.first(3).join(' + ')}"
+      end
+
+      rows = api.get_all('/v1/tickets', query).reject { |t| merged?(t) }
+      next "No tickets created in the #{scope.join(', ')}." if rows.empty?
+
+      group_by = args['group_by'] || 'technician'
+      key_of = lambda do |t|
+        case group_by
+        when 'client' then api.client_name(t['ClientId']) || (t['ClientId'] ? "client #{t['ClientId']}" : '⚠ NO CLIENT')
+        when 'group'  then api.group_name(t['PrimaryGroupId']) || "group #{t['PrimaryGroupId']}"
+        else               api.user_name(t['LeadAssigneeId']) || "user #{t['LeadAssigneeId']}"
+        end
+      end
+
+      answered = []
+      missing  = []
+      rows.each do |t|
+        mins = nested(t, 'Sla', 'FirstResponse', 'ElapsedBusinessMinutes')
+        if mins.nil?
+          missing << t
+        else
+          answered << [t, mins.to_f]
+        end
+      end
+
+      if answered.empty?
+        next "#{rows.size} ticket(s) in scope, but none carries a first-response time. " \
+             'Gorelo records one only when a reply follows the ticket being raised.'
+      end
+
+      pctile = lambda do |sorted, p|
+        return 0.0 if sorted.empty?
+
+        sorted[[((sorted.size - 1) * p).round, sorted.size - 1].min]
+      end
+
+      hm = lambda do |mins|
+        m = mins.round
+        m < 60 ? "#{m}m" : "#{m / 60}h #{(m % 60).to_s.rjust(2, '0')}m"
+      end
+
+      all_mins = answered.map { |(_, m)| m }.sort
+      within   = answered.count { |(_, m)| m <= target }
+
+      out = ["First response - #{scope.join(', ')}. BUSINESS minutes, nights and weekends excluded."]
+      out << "#{rows.size} ticket(s) created; #{answered.size} have a first-response time."
+      out << ''
+      out << "OVERALL   median #{hm.call(pctile.call(all_mins, 0.5))}   " \
+             "90th pct #{hm.call(pctile.call(all_mins, 0.9))}   " \
+             "worst #{hm.call(all_mins.last)}   " \
+             "within #{target}m: #{((within.to_f / answered.size) * 100).round}% " \
+             "(#{within}/#{answered.size})"
+
+      buckets = Hash.new { |h, k| h[k] = [] }
+      answered.each { |(t, m)| buckets[key_of.call(t)] << m }
+
+      out << ''
+      out << "By #{group_by}"
+      out << "#{'Tkts'.rjust(5)}#{'Median'.rjust(10)}#{'90th'.rjust(10)}#{'Worst'.rjust(10)}" \
+             "#{'In target'.rjust(11)}  #{group_by.capitalize}"
+      out << ('-' * 100)
+      buckets.sort_by { |_, v| -pctile.call(v.sort, 0.5) }.first(limit).each do |name, v|
+        sorted = v.sort
+        ok     = v.count { |m| m <= target }
+        out << "#{v.size.to_s.rjust(5)}#{hm.call(pctile.call(sorted, 0.5)).rjust(10)}" \
+               "#{hm.call(pctile.call(sorted, 0.9)).rjust(10)}#{hm.call(sorted.last).rjust(10)}" \
+               "#{"#{((ok.to_f / v.size) * 100).round}%".rjust(11)}  #{clip(name, 40)}"
+      end
+      out << "  … #{buckets.size - limit} more" if buckets.size > limit
+
+      worst = answered.select { |(_, m)| m > target }.sort_by { |(_, m)| -m }
+      if worst.any?
+        out << ''
+        out << "OVER TARGET - #{worst.size} ticket(s) past #{target} business minutes, worst first"
+        out << ('-' * 100)
+        worst.first(10).each do |(t, m)|
+          out << "#{pad(t['DisplayNumber'] || "G-#{t['Number']}", 10)}" \
+                 "#{pad(api.client_name(t['ClientId']) || '?', 26)}#{hm.call(m).rjust(9)}  " \
+                 "#{clip(t['Title'], 46)}"
+        end
+        out << "  … #{worst.size - 10} more" if worst.size > 10
+      end
+
+      if missing.any?
+        out << ''
+        out << "NO FIRST-RESPONSE RECORD - #{missing.size} ticket(s), excluded from every figure"
+        out << 'above. Usually tickets a technician raised themselves, so there was no client'
+        out << 'waiting - but worth a look if the count is high.'
+      end
+      out.join("\n")
+    end
+  end
+
+  # ---- 10. add ticket comment (the first of two writes) -------------------
+
+  # Confirmed from the OpenAPI spec (CreatePublicCommentCommand):
+  #   ConversationTypeId  1 Public, 2 Private, 3 Side Conversation, 4 Approval
+  #   Body                HTML
+  #   CreatedByName       display name for the author
+  #   ConversationId      REJECTED for Public and Private - never send it
+  #
+  # ConversationTypeId is OPTIONAL, which means omitting it lets the server
+  # choose. It is always sent explicitly here: a private note that silently
+  # posts as public is the worst thing this tool could do.
+  CONVERSATION_PUBLIC  = 1
+  CONVERSATION_PRIVATE = 2
+
+  # Body is HTML. Plain text with newlines would render as one run-on blob,
+  # and any < or & in it would be swallowed or corrupt the markup.
+  def to_html(text)
+    escaped = text.to_s
+                  .gsub('&', '&amp;')
+                  .gsub('<', '&lt;')
+                  .gsub('>', '&gt;')
+    escaped.split(/\n{2,}/)
+           .map { |para| "<p>#{para.strip.gsub(/\n/, '<br />')}</p>" }
+           .join
+  end
 
   def add_ticket_comment(server, api)
     server.tool(
@@ -643,8 +1229,8 @@ module GoreloTools
         Safety:
           - disabled unless GORELO_ALLOW_WRITES=true
           - `confirm: true` is required on every call
-          - defaults to an INTERNAL note; set visibility "client" deliberately, as that
-            may email the client
+          - ConversationTypeId is ALWAYS sent explicitly: 2 (Private) unless visibility
+            is set to "client", which sends 1 (Public) and may email the client
           - identical comments on the same ticket within 24 hours are refused, so a
             retried call cannot post twice
       TEXT
@@ -653,8 +1239,9 @@ module GoreloTools
         type: 'object',
         properties: {
           ticket:     { type: 'string', description: 'Ticket number such as G-13933, or a ticket id.' },
-          body:       { type: 'string', description: 'The comment text.' },
-          visibility: { type: 'string', enum: %w[internal client], description: 'Default "internal".' },
+          body:       { type: 'string', description: 'The comment text. Sent as HTML; plain text is converted.' },
+          visibility: { type: 'string', enum: %w[internal client], description: 'Default "internal" (ConversationTypeId 2). "client" posts publicly (1).' },
+          author:     { type: 'string', description: 'Optional display name for the comment author.' },
           confirm:    { type: 'boolean', description: 'Must be true. A deliberate speed bump on the only write path.' }
         },
         required: %w[ticket body confirm],
@@ -667,45 +1254,30 @@ module GoreloTools
 
       visibility = (args['visibility'] || 'internal').downcase
       internal   = visibility != 'client'
+      type_id    = internal ? CONVERSATION_PRIVATE : CONVERSATION_PUBLIC
 
       t = find_ticket(api, args['ticket'])
       next "Could not find ticket #{args['ticket']} - nothing was posted." unless t
 
-      key = api.fingerprint(t['Id'], args['body'].strip)
+      key = api.fingerprint(t['Id'], args['body'].strip, type_id)
       if api.write_fingerprint_seen?(key)
         next "Refused: an identical comment was already posted to #{t['DisplayNumber']} in the " \
              'last 24 hours. Nothing was sent.'
       end
 
-      payload = {
-        'Body'       => args['body'],
-        'Text'       => args['body'],
-        'IsInternal' => internal,
-        'IsPrivate'  => internal
-      }
+      payload = { 'ConversationTypeId' => type_id, 'Body' => to_html(args['body']) }
+      payload['CreatedByName'] = args['author'] if args['author']
+      # ConversationId is rejected for Public and Private - deliberately absent.
 
-      posted = nil
-      errors = []
-      COMMENT_POST_PATHS.each do |seg|
-        begin
-          api.post("/v1/tickets/#{t['Id']}/#{seg}", payload)
-          posted = seg
-          break
-        rescue Gorelo::AuthError
-          raise
-        rescue Gorelo::Error => e
-          errors << "#{seg}: #{e.message}"
-        end
+      begin
+        api.post("/v1/tickets/#{t['Id']}/comments", payload)
+      rescue Gorelo::Error => e
+        next "Nothing was posted. #{e.message}"
       end
 
-      unless posted
-        next "Could not post. Tried #{COMMENT_POST_PATHS.join(', ')}:\n  " + errors.join("\n  ") +
-             "\nUse gorelo_api_probe to confirm the write path before retrying."
-      end
-
-      api.record_write(key, "#{t['DisplayNumber']} via #{posted} (#{visibility})")
-      "Posted #{internal ? 'an internal' : 'a CLIENT-VISIBLE'} comment to #{t['DisplayNumber']} - #{t['Title']} " \
-        "(via /v1/tickets/{id}/#{posted})."
+      api.record_write(key, "#{t['DisplayNumber']} ConversationTypeId=#{type_id}")
+      "Posted #{internal ? 'a PRIVATE (internal) note' : 'a PUBLIC, client-visible comment'} " \
+        "to #{t['DisplayNumber']} - #{t['Title']}."
     end
   end
 
@@ -748,4 +1320,163 @@ module GoreloTools
       header + (json.length > chars ? "#{json[0, chars]}\n… truncated (#{json.length} chars total)" : json)
     end
   end
+
+  # ---- 11. update ticket (the second and last write) ----------------------
+  #
+  # Scoped to TWO fields: client and status. Not the title, not the assignee,
+  # not the priority, and never a deletion.
+  #
+  # THE PROBLEM THIS TOOL IS BUILT AROUND: the exact PATCH payload schema is
+  # not knowable from here - the published swagger.json is too large to read
+  # through a summarising fetch without silent truncation. And this API IGNORES
+  # fields it does not recognise rather than rejecting them, which is the same
+  # trap as the query parameters: a wrong field name returns 200 and changes
+  # nothing, which reads exactly like success.
+  #
+  # So this tool does not trust the write. It reads the ticket, writes, reads it
+  # back, and CONFIRMS the value actually changed. If it did not, it says so
+  # loudly and names the likely cause instead of reporting a write that never
+  # happened. That turns an unknown schema from a silent failure into a
+  # detected one.
+  def update_ticket(server, api)
+    server.tool(
+      name:  'gorelo_update_ticket',
+      title: 'Set a ticket\'s client or status',
+      description: <<~TEXT,
+        Change the CLIENT or the STATUS on one ticket. Nothing else is writable through this
+        tool - not the title, not the assignee, not the priority - and there is no delete
+        path anywhere in this server.
+
+        Built for two specific recurring problems: a ticket with NO client attached never
+        appears in any client-scoped review, and a ticket parked in the wrong status sits
+        in a queue that then means two different things.
+
+        Every change is VERIFIED: the ticket is read, written, and read back, and the reply
+        states the before and after values. Gorelo ignores unrecognised fields rather than
+        rejecting them, so a write that silently did nothing would otherwise look identical
+        to one that worked.
+
+        Requires GORELO_ALLOW_WRITES=true and confirm: true.
+      TEXT
+      input_schema: {
+        type: 'object',
+        properties: {
+          ticket:  { type: 'string', description: 'Ticket number such as G-13529, or a ticket id.' },
+          client:  { type: 'string', description: 'Client name fragment or id to attach. Must match exactly one client.' },
+          status:  { type: 'string', description: 'Status name to move the ticket to, e.g. "Closed", "Billing". Matched against the live status list.' },
+          author:  { type: 'string', description: 'Display name recorded against the change (UpdatedByName). Defaults to "Gorelo MCP" so an automated edit is never attributed to a person.' },
+          confirm: { type: 'boolean', description: 'Must be true. Nothing is written without it.' }
+        },
+        required: %w[ticket confirm],
+        additionalProperties: false
+      },
+      read_only: false
+    ) do |args|
+      unless api.writes_allowed?
+        next 'Writes are disabled. Set GORELO_ALLOW_WRITES=true in .env and restart to enable ' \
+             'the two write tools.'
+      end
+      next 'Refused: confirm must be true. Nothing was written.' unless args['confirm'] == true
+
+      if args['client'].to_s.strip.empty? && args['status'].to_s.strip.empty?
+        next 'Nothing to do: give a client, a status, or both.'
+      end
+
+      t = find_ticket(api, args['ticket'])
+      next "No ticket #{args['ticket']} found. Check the number." unless t
+
+      # PATCH /v1/tickets/{ticketId} accepts far more than this: Title,
+      # LeadAssigneeId, AssistingAssigneeIds, WatcherIds, PriorityId, TypeId,
+      # TagIds, GroupIds, ContactId, CcContactIds, AgentAssetIds,
+      # CustomAssetIds, UptimeIds and BillingOverride. Sending only ClientId and
+      # StatusId is a deliberate restriction, not a limit of the endpoint -
+      # reassigning a ticket or rewriting its title from here would change
+      # someone else's queue without them seeing it happen.
+
+      # UpdatedByName is the counterpart to CreatedByName on comments. Unlike a
+      # comment, a status or client change leaves NO visible content in the
+      # ticket - only a history line - so an unattributed one is indistinguishable
+      # from a human doing it by hand. It is defaulted rather than optional for
+      # that reason: automated edits should always look automated.
+      payload = { 'UpdatedByName' => (args['author'].to_s.strip.empty? ? 'Gorelo MCP' : args['author']) }
+      intent  = []
+
+      unless args['client'].to_s.strip.empty?
+        matched = api.resolve_clients(args['client'])
+        next "No client matches #{args['client'].inspect}." if matched.empty?
+        if matched.size > 1
+          next "#{matched.size} clients match #{args['client'].inspect}: " \
+               "#{matched.first(8).map { |c| "#{c['Id']} #{c['Name']}" }.join(', ')}. Narrow it."
+        end
+
+        payload['ClientId'] = matched.first['Id']
+        intent << "client #{api.client_name(t['ClientId']) || '(none)'} → #{matched.first['Name']}"
+      end
+
+      unless args['status'].to_s.strip.empty?
+        needle = args['status'].to_s.strip.downcase
+        st = api.statuses.values.find { |x| x['Name'].to_s.downcase == needle } ||
+             api.statuses.values.find { |x| x['Name'].to_s.downcase.include?(needle) }
+        unless st
+          next "No status matches #{args['status'].inspect}. Available: " \
+               "#{api.statuses.values.map { |x| x['Name'] }.join(', ')}"
+        end
+
+        payload['StatusId'] = st['Id']
+        intent << "status #{nested(t, 'Status', 'Name')} → #{st['Name']}"
+      end
+
+      before = { client: t['ClientId'], status: nested(t, 'Status', 'Id') }
+
+      begin
+        api.patch("/v1/tickets/#{t['Id']}", payload)
+      rescue Gorelo::WritesDisabled => e
+        next e.message
+      rescue Gorelo::Error => e
+        next "Gorelo refused the update: #{e.message}"
+      end
+
+      after_row = begin
+        api.get("/v1/tickets/#{t['Id']}")['Data']
+      rescue Gorelo::Error
+        nil
+      end
+      unless after_row.is_a?(Hash)
+        next "Sent the update to #{t['DisplayNumber']} but could NOT read the ticket back to " \
+             'confirm it. Check in Gorelo before assuming it applied.'
+      end
+
+      after = { client: after_row['ClientId'], status: nested(after_row, 'Status', 'Id') }
+      # Only the two fields this tool sets are verifiable - UpdatedByName is
+      # write-only and does not come back on a GET.
+      failed = []
+      failed << 'ClientId' if payload.key?('ClientId') && after[:client].to_s != payload['ClientId'].to_s
+      failed << 'StatusId' if payload.key?('StatusId') && after[:status].to_s != payload['StatusId'].to_s
+
+      # Audit trail. Not a duplicate guard - unlike a comment, re-applying the
+      # same status twice is harmless, so this records rather than refuses.
+      api.record_write(api.fingerprint(t['Id'], payload.to_json),
+                       "PATCH /v1/tickets/#{t['Id']} #{payload.to_json} " \
+                       "→ #{failed.empty? ? 'applied' : "NO EFFECT on #{failed.join(',')}"}")
+
+      out = ["#{t['DisplayNumber'] || "G-#{t['Number']}"}  #{t['Title']}"]
+      if failed.empty?
+        out << "Updated: #{intent.join('; ')}"
+        out << "Verified by reading the ticket back: client=#{api.client_name(after[:client]) || after[:client]}, " \
+               "status=#{nested(after_row, 'Status', 'Name')}"
+      else
+        out << "⚠ THE WRITE DID NOT TAKE EFFECT for: #{failed.join(', ')}"
+        out << "Gorelo accepted the request and returned success, but reading the ticket back"
+        out << "shows the value unchanged (client=#{before[:client].inspect}, status=#{before[:status].inspect})."
+        out << ''
+        out << 'The most likely cause is that the field name in the PATCH payload is wrong.'
+        out << 'This API ignores unrecognised fields instead of rejecting them, so a wrong'
+        out << 'name returns 200 and changes nothing. Check the PATCH request schema for'
+        out << "/v1/tickets/{ticketId} in Gorelo's swagger and correct the payload in"
+        out << "gorelo_update_ticket. Sent: #{payload.to_json}"
+      end
+      out.join("\n")
+    end
+  end
+
 end

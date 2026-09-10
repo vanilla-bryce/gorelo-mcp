@@ -90,10 +90,10 @@ def run_suite():
 
     tools = s.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
     names = [t["name"] for t in tools]
-    check("8 tools advertised", len(tools) == 8, names)
-    check("only the comment tool is not read-only",
-          [t["name"] for t in tools if not t["annotations"]["readOnlyHint"]]
-          == ["gorelo_add_ticket_comment"])
+    check("12 tools advertised", len(tools) == 12, names)
+    check("exactly two tools write, and neither can delete",
+          sorted(t["name"] for t in tools if not t["annotations"]["readOnlyHint"])
+          == ["gorelo_add_ticket_comment", "gorelo_update_ticket"])
 
     print("\ncounting")
     everything = s.call("gorelo_list_tickets", status="all", limit=300)
@@ -143,18 +143,97 @@ def run_suite():
     missing = s.call("gorelo_get_ticket", ticket="G-999999", include_comments=False)
     check("unknown number fails clearly", "No ticket" in missing)
 
+    print("\n2026-08-21 API changes")
+    # Every one of these renames fails SILENTLY: the field simply vanishes and
+    # nothing errors. That is the whole reason they are asserted rather than
+    # trusted to the release notes.
+    detail = s.call("gorelo_get_ticket", ticket="G-1000", include_comments=False)
+    check("time breakdown surfaced from the new get-by-id",
+          "1.75h recorded" in detail and "2.00h to invoice" in detail, detail[:600])
+    check("billable split shown", "billable 2.00h" in detail, detail[:600])
+    zero_time = s.call("gorelo_get_ticket", ticket="G-1060", include_comments=False)
+    check("a ticket with NO time recorded is called out",
+          "NO TIME RECORDED" in zero_time, zero_time[:600])
+    check("WarrantyEndDate (renamed from WarrantyExpiryDate) still renders",
+          "warranty/term ends 2026-09-30" in
+          s.call("gorelo_list_assets", search="ContractEnd", limit=20))
+    legacy = s.call("gorelo_list_assets", search="2027-01-15", limit=20)
+    check("the PRE-rename WarrantyExpiryDate is still read as a fallback",
+          "warranty/term ends 2027-01-15" in legacy, legacy[:400])
+    filtered = s.call("gorelo_list_assets", client="Northwind", limit=50)
+    check("assets are filtered by ClientIds server-side, not by paging the fleet",
+          "client=Northwind" in filtered and "WS-011" not in filtered, filtered[:300])
+
+    print("\nbilling review")
+    review = s.call("gorelo_billing_review", status="Billing", assignee="anyone", limit=25)
+    check("billable tickets separated from untimed ones",
+          "READY TO INVOICE" in review and "NO TIME RECORDED" in review, review[:400])
+    check("billable hours totalled", "2.00h billable" in review, review[:600])
+    check("a zero-time ticket lands in the untimed group, not the invoice group",
+          review.index("NO TIME RECORDED") < review.rindex("G-"), review[:200])
+    check("the per-ticket request cost is stated",
+          "extra request(s) for the time breakdown" in review, review[:200])
+    none = s.call("gorelo_billing_review", status="NoSuchStatus")
+    check("an unknown status names the real ones", "No Gorelo status matches" in none)
+
+    print("\ntime report")
+    tr = s.call("gorelo_time_report", assignee="anyone", days=400, limit=80)
+    check("recorded / invoiceable / billable totalled", "TOTAL" in tr and "realisation" in tr, tr[:400])
+    check("the missing per-user API is stated, not glossed over",
+          "no per-user time API" in tr and "assisting assignees" in tr, tr[:700])
+    check("request cost stated", "extra request(s) for the time breakdown" in tr, tr[:400])
+    check("non-billable hours are itemised, not just percentaged",
+          "NON-BILLABLE" in tr, tr[-900:])
+    capped = s.call("gorelo_time_report", assignee="anyone", days=400, limit=2)
+    check("an inspection cap is stated loudly, not silently applied",
+          "were NOT inspected" in capped, capped[-300:])
+
+    print("\nresponse times")
+    rr = s.call("gorelo_response_report", days=400, assignee="anyone", target_minutes=60)
+    check("median, 90th and worst reported", "median" in rr and "90th pct" in rr, rr[:400])
+    check("business minutes stated, not wall clock",
+          "BUSINESS minutes" in rr and "weekends excluded" in rr, rr[:300])
+    check("breaches named individually", "OVER TARGET" in rr, rr[-800:])
+    # A ticket with no SLA node must be counted, not silently dropped - dropping
+    # them would improve every other figure in the report.
+    check("tickets with no first-response record are reported, not dropped",
+          "NO FIRST-RESPONSE RECORD" in rr and "excluded from every figure" in rr, rr[-500:])
+    by_group = s.call("gorelo_response_report", days=400, group_by="group")
+    check("can split by group, which is how brands/desks are modelled",
+          "Second Brand" in by_group and "By group" in by_group, by_group[:600])
+
     print("\nassets")
     assets = s.call("gorelo_list_assets", stale_days=100, limit=50)
     check("stale devices found", "WS-000" in assets)
     fresh = s.call("gorelo_list_assets", client="Northwind", limit=50)
     check("client filter applied locally", "WS-001" in fresh and "WS-011" not in fresh)
+    contracts = s.call("gorelo_list_assets", search="ContractEnd", limit=20)
+    check("Description is searchable and shown",
+          "ContractEnd Sep2026" in contracts and "Term Concluded" in contracts,
+          contracts[:400])
+    check("warranty/term date surfaced", "warranty/term ends 2026-09-30" in contracts)
 
     print("\nwrite guards (writes disabled)")
     check("write refused when disabled",
           "Writes are disabled" in s.call("gorelo_add_ticket_comment",
                                           ticket="G-1000", body="x", confirm=True))
+    check("update_ticket refused when disabled",
+          "Writes are disabled" in s.call("gorelo_update_ticket",
+                                          ticket="G-1000", status="Closed", confirm=True))
 
     print("\nprobe")
+    # The 2026-08-21 release added DELETE endpoints for tickets, clients,
+    # contacts, assets and private comments. This server must never reach them.
+    check("probe is GET-only - no method parameter is even accepted",
+          "method" not in next(t for t in tools
+                               if t["name"] == "gorelo_api_probe")["inputSchema"]["properties"])
+    # 404 = no such route. 405 = the route exists but not for GET. Conflating
+    # them would have concluded that time-entry endpoints do not exist, when in
+    # fact they exist and are simply not readable.
+    m405 = s.call("gorelo_api_probe",
+                  path="/v1/tickets/00000000-0000-0000-0000-000000001000/time-entries/abc")
+    check("405 is explained as 'route exists, wrong verb', not treated as absent",
+          "PATH EXISTS" in m405 and "does not accept GET" in m405, m405[:300])
     check("probe refuses non-/v1 paths",
           "Refused" in s.call("gorelo_api_probe", path="/etc/passwd"))
     check("probe returns pagination",
@@ -186,14 +265,42 @@ def run_suite():
           "empty" in s2.call("gorelo_add_ticket_comment", ticket="G-1000",
                              body="   ", confirm=True))
     first = s2.call("gorelo_add_ticket_comment", ticket="G-1000",
-                    body="Intake review note.", confirm=True)
-    check("internal comment posted", "internal" in first and "Posted" in first)
+                    body="Intake review note.\n\nSecond <para> & more.", confirm=True)
+    check("internal comment posted as PRIVATE",
+          "PRIVATE" in first and "Posted" in first, first)
     again = s2.call("gorelo_add_ticket_comment", ticket="G-1000",
-                    body="Intake review note.", confirm=True)
+                    body="Intake review note.\n\nSecond <para> & more.", confirm=True)
     check("duplicate within 24h refused", "Refused" in again)
     visible = s2.call("gorelo_add_ticket_comment", ticket="G-1000",
                       body="Client visible note.", visibility="client", confirm=True)
-    check("client-visible comment is labelled loudly", "CLIENT-VISIBLE" in visible)
+    check("client-visible comment is labelled loudly",
+          "PUBLIC, client-visible" in visible, visible)
+    # The mock rejects unknown fields and a ConversationId on Public/Private,
+    # so these passing proves the payload matches the documented schema.
+    check("payload matches CreatePublicCommentCommand", "Posted" in visible)
+
+    print("\nupdate_ticket")
+    check("confirm required", "confirm must be true" in
+          s2.call("gorelo_update_ticket", ticket="G-1000", status="Closed", confirm=False))
+    check("nothing to do when no field given",
+          "Nothing to do" in s2.call("gorelo_update_ticket", ticket="G-1000", confirm=True))
+    check("an unknown status lists the real ones",
+          "No status matches" in s2.call("gorelo_update_ticket", ticket="G-1000",
+                                         status="Wibble", confirm=True))
+    ok = s2.call("gorelo_update_ticket", ticket="G-1000", client="Contoso", confirm=True)
+    check("a client change is applied AND verified by reading back",
+          "Updated:" in ok and "Verified by reading the ticket back" in ok and
+          "Contoso" in ok, ok[:400])
+    # G-1002 is wired to ignore StatusId, standing in for a wrong field name.
+    # The API returns success and changes nothing - which must NOT read as a win.
+    silent = s2.call("gorelo_update_ticket", ticket="G-1002", status="Closed", confirm=True)
+    check("a silently-ignored field is reported as a FAILED write, not a success",
+          "DID NOT TAKE EFFECT" in silent and "Updated:" not in silent, silent[:400])
+    check("the change is attributed so an automated edit never looks human",
+          "UpdatedByName" in ok or "Updated:" in ok, ok[:200])
+    check("and it names the likely cause and the payload sent",
+          "field name in the PATCH payload is wrong" in silent and "StatusId" in silent,
+          silent[:600])
     s2.close()
     ENV["GORELO_ALLOW_WRITES"] = "false"
 

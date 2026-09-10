@@ -7,7 +7,7 @@ It runs on your own machine and speaks [MCP](https://modelcontextprotocol.io) ov
 stdin/stdout. Nothing is hosted, nothing is exposed to the internet, and your API key never
 leaves your computer.
 
-**Eight tools, seven of them read-only.** Plain Ruby — **no gems, no Bundler, no build step.**
+**Twelve tools, ten of them read-only.** Plain Ruby — **no gems, no Bundler, no build step.**
 
 ---
 
@@ -134,22 +134,73 @@ Restart your MCP client. Then ask it something like *"list my open Gorelo ticket
 | `gorelo_get_client` | | One client's whole footprint: tickets, contacts, devices |
 | `gorelo_get_contact` | | Find a person by name or email across all clients |
 | `gorelo_list_assets` | | Managed devices, filterable by client or last-seen age |
-| `gorelo_add_ticket_comment` | **yes** | The only write. Off by default. |
+| `gorelo_billing_review` | | The Billing queue split by recorded hours — invoice, re-file, or set up a recurring charge |
+| `gorelo_time_report` | | Recorded vs invoiceable vs billable hours, and realisation, by technician or client |
+| `gorelo_response_report` | | First-response times — median, 90th, worst, share within target. Costs no extra requests |
+| `gorelo_add_ticket_comment` | **yes** | One of two writes. Off by default. |
+| `gorelo_update_ticket` | **yes** | Sets a ticket's client or status — nothing else. Off by default. |
 | `gorelo_api_probe` | | Raw `GET` on any `/v1/…` path, for exploring |
 
-### The write tool
+### The write tools
 
 Four guards sit in front of `gorelo_add_ticket_comment`:
 
 1. **Disabled** unless `GORELO_ALLOW_WRITES=true`
 2. **`confirm: true` required** on every call
-3. **Defaults to an internal note** — `visibility: "client"` has to be asked for, because it
-   may email the client
+3. **`ConversationTypeId` is always sent explicitly** — `2` (Private) by default, `1` (Public)
+   only when `visibility: "client"` is asked for. The field is *optional* in the API, so
+   omitting it lets the server pick, and a private note posting publicly is the worst thing
+   this tool could do. It is never left to a default.
 4. **Identical comments within 24 hours are refused.** MCP has no transport-level
    idempotency, so a retried call could otherwise post twice. A fingerprint log at
-   `~/.gorelo-mcp-writes.jsonl` prevents it.
+   `~/.gorelo-mcp-writes.jsonl` prevents it. The fingerprint includes the visibility, so the
+   same text cannot be posted once privately and once publicly by accident.
 
-Leave it off until the read tools have earned their place.
+The body is sent as **HTML**, because that is what the API expects. Plain text is escaped and
+paragraph-wrapped, so `<` and `&` cannot corrupt the markup.
+
+The request body is `CreatePublicCommentCommand`: `ConversationTypeId`, `Body`,
+`CreatedByName`, `Attachments`. `ConversationId` is **rejected** for Public and Private and is
+never sent. The test mock enforces all of that — it rejects unknown fields — so the suite
+fails if the payload drifts from the documented schema.
+
+#### `gorelo_update_ticket`
+
+Sets **the client or the status**, and nothing else. Not the title, not the assignee, not the
+priority.
+
+It exists for two recurring problems: a ticket with **no client attached** never appears in any
+client-scoped review, and a ticket parked in the wrong status makes a queue mean two things.
+
+**The endpoint accepts far more than this tool sends.** The documented PATCH body includes
+`Title`, `LeadAssigneeId`, `AssistingAssigneeIds`, `WatcherIds`, `PriorityId`, `TypeId`,
+`TagIds`, `GroupIds`, `ContactId`, `CcContactIds`, `AgentAssetIds`, `CustomAssetIds`,
+`UptimeIds` and `BillingOverride`. Sending only `ClientId` and `StatusId` is a deliberate
+restriction — reassigning a ticket or rewriting its title from here would change someone
+else's queue without them watching it happen.
+
+**Changes are attributed.** `UpdatedByName` is set (default `"Gorelo MCP"`, overridable with
+`author`). Unlike a comment, a status change leaves no visible content in the ticket — only a
+history line — so an unattributed one is indistinguishable from a human doing it by hand.
+
+**Every change is verified.** The tool reads the ticket, writes, reads it back, and confirms
+the value actually moved — then reports before and after. That is not belt-and-braces: this API
+**ignores fields it does not recognise instead of rejecting them**, exactly as it does with
+query parameters, so a mistyped payload field returns `200` and changes nothing. Without the
+read-back, a write that never happened is indistinguishable from one that did. When the check
+fails the tool says so loudly, names the likely cause, and prints the payload it sent.
+
+### There is no DELETE, anywhere
+
+Gorelo now exposes `DELETE` for tickets, clients, contacts, agent assets, custom assets,
+private comments and time entries. **None of it is reachable from here, and the guarantee is
+structural rather than a policy**: `Gorelo::Client` has `get`, `post` and `patch` methods and
+no `delete` method at all. A tool cannot call a method that does not exist.
+
+`gorelo_api_probe` is likewise GET-only — it has no `method` parameter to pass, which the test
+suite asserts against the published tool schema.
+
+Leave both write tools off until the read tools have earned their place.
 
 ---
 
@@ -177,7 +228,7 @@ Confirmed working:
 
 ```
 /v1/tickets                       GET, POST
-/v1/tickets/{id}                  GET
+/v1/tickets/{id}                  GET   ← much richer than a list row; see below
 /v1/tickets/{id}/comments         GET, POST   (oldest-first; ConversationType filter)
 /v1/tickets/{id}/comments/{id}    GET
 /v1/tickets/{id}/conversations    GET
@@ -185,9 +236,52 @@ Confirmed working:
 /v1/tickets/statuses | /tags | /types
 /v1/clients
 /v1/contacts                      ClientId is SINGULAR here
-/v1/assets/agents                 no client filter
+/v1/assets/agents                 ClientIds filter since 2026-08-21
+/v1/assets/custom                 since 2026-08-21
 /v1/organization/users
 ```
+
+### The 2026-08-21 release
+
+**Three fields were renamed, and every one of them fails silently.** A renamed field does not
+error — it simply stops appearing, so a flag stops showing and a date vanishes from a report
+with nothing to say it happened. This server reads **both** names so it works against a tenant
+on either version:
+
+| Endpoint | Was | Now |
+|---|---|---|
+| `/v1/tickets` | `IsAwaitingClient` | `IsWaitingOnThem` |
+| `/v1/tickets` | SLA minutes | `Sla.FirstResponse.ElapsedBusinessMinutes` |
+| `/v1/assets/agents` | `ClientLocationId` | `LocationId` |
+| `/v1/assets/agents` | `WarrantyExpiryDate` | `WarrantyStartDate` + `WarrantyEndDate` |
+| `/v1/contacts` | `ClientLocationId` | `LocationId` |
+
+**`GET /v1/tickets/{id}` now answers billing questions the API previously could not.** A list
+row does not carry any of this — only the get-by-id does, so a tool that wants it must fetch
+the detail even when it already has the ticket:
+
+```
+Time.ActualHours          what was recorded
+Time.AdjustedHours        what will be invoiced
+Time.Breakdown.Billable / .NotBillable / .NotBillableHidden
+Products.Count / .TotalAmount
+BillingOverride, Shipments, Description, AgentAssetIds, Banner
+```
+
+The distinction that matters for a backlog review: **a ticket sitting in *Billing* with
+`ActualHours` of 0 was never time-recorded**, which is a different problem — and a different
+fix — from one with hours that simply have not been invoiced yet. `gorelo_get_ticket` flags
+both.
+
+**Filtering arrived on clients, contacts and agent assets:** `StatusIds`, `ClientIds`, keyword
+`Query`, and created/updated date ranges. `gorelo_list_assets` used to page the entire fleet —
+626 devices on a real tenant — to show four; it now sends `ClientIds`. Verified applied rather
+than ignored by the FilterHash trick below.
+
+⚠️ **DELETE endpoints now exist** for agent assets, custom assets, clients, contacts, tickets
+and private comments. **This server never sends DELETE**, and `gorelo_api_probe` is GET-only —
+both asserted in the test suite so it stays that way. Blocked deletes return 409 naming what is
+in the way.
 
 **Gorelo publishes a full OpenAPI spec** — read it before guessing at parameter names:
 
@@ -222,6 +316,13 @@ content**, and never rely on deleting a comment to remove sensitive data.
 
 ### Two tricks worth stealing
 
+**405 versus 404 maps the surface.** A `404` means no route of any verb matches that path. A
+`405` means **the route exists and does not accept this one**. So a plain `GET` against a
+candidate path is a reliable existence test, even for write-only endpoints this server would
+never call — which is how the DELETE-only time-entry route above was confirmed after two
+wrongly-spelled guesses had returned 404. `gorelo_api_probe` explains any 405 it gets rather
+than reporting it as a dead end.
+
 `DataContext.Pagination.TotalCount` comes back on every query, so **counting anything costs
 one request** with `PageSize=1`.
 
@@ -253,7 +354,7 @@ python3 test/mock_gorelo.py       # in one terminal
 python3 test/drive.py             # in another
 ```
 
-35 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
+69 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
 assisting assignees, watcher-only exclusion, closed-ticket exclusion, lookup by number,
 deleted comments, cursor pagination, rate-limit retry, every write guard, and the protocol
 edge cases (unknown method, unknown tool, malformed input).
@@ -288,5 +389,43 @@ resources — leaves the tools unchanged.
 which would corrupt the line framing, and JSON is generated `ascii_only` so the bytes on the
 wire are pure ASCII whatever the machine's code page.
 
-**Not available in the API:** time entries, invoices, contracts, products. Gorelo's public API
-doesn't expose them, so anything billing-related has to come from elsewhere.
+**Not readable through the API:** invoices, contracts, and **time entries**.
+
+Confirmed endpoints (this list is what has been *observed*, not a claim to completeness — see
+the warning below):
+
+```
+/v1/alerts (POST)                     /v1/organization/users
+/v1/assets/agents      {id}           /v1/organization/groups
+/v1/assets/custom      {id}           /v1/tickets
+/v1/clients            {id}           /v1/tickets/{ticketId}   GET PATCH DELETE
+/v1/clients/{id}/locations            /v1/contacts             {id}
+/v1/tickets/{id}/time-entries/{id}    DELETE only — see below
+```
+
+### Time entries exist, and cannot be read
+
+`/v1/tickets/{ticketId}/time-entries/{id}` **is a real route** — a `GET` returns **405 Method
+Not Allowed**, not 404. But:
+
+- the **collection** path `/v1/tickets/{id}/time-entries` returns 404 — no route at all;
+- `/v1/time-entries/{id}` returns 404 — it is ticket-scoped only;
+- the ticket detail carries `Time` **totals**, never individual entry ids.
+
+So Gorelo ships a way to **delete** a time entry and no way to **read** one. Nothing in the API
+will tell you an entry's id, which makes the DELETE unusable from the API alone. Worth raising
+with them; until it changes, hours exist only as a per-ticket total.
+
+That is why `gorelo_time_report` attributes a ticket's hours to its lead assignee — counting an
+assisting technician's time against the lead — says so on every run, and leans on
+**realisation** (billable ÷ invoiceable), a ratio that survives the attribution problem far
+better than a per-person total does.
+
+⚠️ **Do not treat any endpoint list as complete, including this one.** The published
+`swagger.json` is large enough that fetching it through a summarising tool silently truncates,
+and a truncated list reads exactly like a short one. The time-entry route above was missed
+precisely that way — declared absent on the strength of a partial read of the spec plus two
+404s on the wrong path spellings.
+
+⚠️ Note `/v1/tickets/{ticketId}` now accepts **PATCH** and **DELETE**, and clients and contacts
+accept **POST/PATCH/DELETE**. This server issues none of them.

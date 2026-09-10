@@ -9,7 +9,8 @@
 #     (a `page` parameter is silently ignored, which loops forever)
 #   - PageSize is clamped to 1..200
 #   - /v1/contacts filters on ClientId (singular); /v1/tickets on ClientIds
-#   - /v1/assets/agents has no client filter at all
+#   - /v1/assets/agents gained ClientIds filtering on 2026-08-21; before
+#     that it had no filters at all and the whole fleet had to be paged
 
 require 'net/http'
 require 'uri'
@@ -73,6 +74,14 @@ module Gorelo
 
     def writes_allowed? = @allow_writes
 
+    def guard_writes!
+      return if @allow_writes
+
+      raise WritesDisabled,
+            'Writes are disabled. Set GORELO_ALLOW_WRITES=true in .env and restart ' \
+            'the client to enable the write tools.'
+    end
+
     # ---- HTTP -------------------------------------------------------------
 
     def get(path, query = {})
@@ -80,12 +89,22 @@ module Gorelo
     end
 
     def post(path, body, query = {})
-      unless @allow_writes
-        raise WritesDisabled,
-              'Writes are disabled. Set GORELO_ALLOW_WRITES=true in .env and restart ' \
-              'the client to enable the one write tool.'
-      end
+      guard_writes!
       request(Net::HTTP::Post, path, query: query, body: body)
+    end
+
+    # PATCH exists for tickets, clients and contacts. Only tickets are reachable
+    # from this server, and only two fields on them - see gorelo_update_ticket.
+    #
+    # There is deliberately NO `delete` method on this class. Gorelo now exposes
+    # DELETE for tickets, clients, contacts, agent assets, custom assets,
+    # private comments and time entries. None of that belongs behind an
+    # assistant, and the strongest way to say so is for the verb to be absent
+    # rather than merely unused - a tool cannot call a method that does not
+    # exist.
+    def patch(path, body, query = {})
+      guard_writes!
+      request(Net::HTTP::Patch, path, query: query, body: body)
     end
 
     # Follows DataContext.Pagination.NextCursor until exhausted. `limit` stops
@@ -184,6 +203,33 @@ module Gorelo
 
     def users
       @cache[:users] ||= get_all('/v1/organization/users')
+    end
+
+    def groups
+      @cache[:groups] ||= get_all('/v1/organization/groups')
+    end
+
+    # Gorelo groups are how separate desks or brands are modelled - each can
+    # carry its own outbound helpdesk address - so they are a real reporting
+    # dimension, not just an internal routing detail.
+    def group_name(group_id)
+      return nil if group_id.nil?
+
+      @cache[:group_names] ||= groups.each_with_object({}) { |g, h| h[g['Id'].to_s] = g['Name'] }
+      @cache[:group_names][group_id.to_s]
+    end
+
+    # Display name for a technician id, for reports that group by assignee.
+    def user_name(user_id)
+      return nil if user_id.nil?
+
+      @cache[:user_names] ||= users.each_with_object({}) do |u, h|
+        name = u['Name'] || u['DisplayName'] ||
+               [u['FirstName'], u['LastName']].compact.join(' ').strip
+        name = u['Email'] if name.to_s.strip.empty?
+        h[u['Id'].to_s] = name
+      end
+      @cache[:user_names][user_id.to_s]
     end
 
     # Resolves "me", an email, a name fragment or a numeric id to a user id.
@@ -315,6 +361,24 @@ module Gorelo
       unless code.between?(200, 299)
         detail = parsed ? summarise_notifications(parsed) : res.body.to_s[0, 400]
         message = "Gorelo returned HTTP #{code} for #{uri.path}: #{detail}"
+
+        # 405 is the single most informative status this API returns, and it
+        # arrives with an empty body, so it has to be explained here or it
+        # reads as a dead end.
+        #
+        # 404 = no route of ANY method matches that path.
+        # 405 = the route EXISTS but does not accept this verb.
+        #
+        # That difference is how you map an undocumented surface without
+        # guessing: GET a candidate path, and a 405 proves the endpoint is real
+        # even though this server will only ever read from it. It is how
+        # /v1/tickets/{id}/time-entries/{id} was confirmed to exist as a
+        # DELETE-only route with no readable counterpart.
+        if code == 405
+          raise Error, "#{message}\n  405 means this PATH EXISTS but does not accept GET - " \
+                       "it is defined for another verb (POST, PATCH or DELETE).\n  This server " \
+                       'only ever issues GET, so the endpoint is real but not readable from here.'
+        end
 
         if code == 429 || code >= 500
           raise RetryableError.new(message, short: "HTTP #{code}",
