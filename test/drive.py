@@ -17,6 +17,7 @@ the write guards, and the protocol edge cases.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -90,7 +91,7 @@ def run_suite():
 
     tools = s.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
     names = [t["name"] for t in tools]
-    check("12 tools advertised", len(tools) == 12, names)
+    check("16 tools advertised", len(tools) == 16, names)
     check("exactly two tools write, and neither can delete",
           sorted(t["name"] for t in tools if not t["annotations"]["readOnlyHint"])
           == ["gorelo_add_ticket_comment", "gorelo_update_ticket"])
@@ -176,17 +177,109 @@ def run_suite():
     none = s.call("gorelo_billing_review", status="NoSuchStatus")
     check("an unknown status names the real ones", "No Gorelo status matches" in none)
 
-    print("\ntime report")
-    tr = s.call("gorelo_time_report", assignee="anyone", days=400, limit=80)
-    check("recorded / invoiceable / billable totalled", "TOTAL" in tr and "realisation" in tr, tr[:400])
-    check("the missing per-user API is stated, not glossed over",
-          "no per-user time API" in tr and "assisting assignees" in tr, tr[:700])
-    check("request cost stated", "extra request(s) for the time breakdown" in tr, tr[:400])
+    print("\ntime report - rebuilt on /v1/time-entries (Gorelo, 4 Sep 2026)")
+    tr = s.call("gorelo_time_report", assignee="anyone", days=400)
+    check("recorded / invoiceable / billable totalled",
+          "TOTAL" in tr and "realisation" in tr, tr[:400])
+    # The tool used to print "Gorelo has NO per-user time API" on every run, and
+    # to call per-person totals "indicative". Both were true until 4 Sep 2026 and
+    # are false now. A corrected README beside a stale caveat is worse than
+    # either alone, so the absence is asserted.
+    check("the retired 'no per-user time API' caveat is gone",
+          "no per-user time API" not in tr and "indicative" not in tr, tr[:1200])
+    check("per-person figures are stated as exact, and why",
+          "Per-person figures are EXACT" in tr and "assisting time lands on whoever" in tr,
+          tr[:900])
+    rows_returned = int(re.search(r"(\d+) time entry row\(s\) returned", tr).group(1))
+    check("cursor pagination is exercised - more entries than one 200-row page",
+          rows_returned > 200, rows_returned)
+    check("both technicians appear, so assisting time is not booked to the lead",
+          "Sam Rivers" in tr and "Alex Kim" in tr, tr[:900])
+    check("every BillableStatus is shown with its hours, not just the billable one",
+          "No Charge" in tr and "Not Billable" in tr and "counted billable" in tr, tr[:1400])
+    check("realisation is adjusted/actual, with the billable share as its own column",
+          "Real." in tr and "Bill%" in tr, tr[:1200])
     check("non-billable hours are itemised, not just percentaged",
           "NON-BILLABLE" in tr, tr[-900:])
+    check("the request cost is measured and is no longer one per ticket",
+          "request(s) in total" in tr and
+          "extra request(s) for the time breakdown" not in tr, tr[:400])
+
+    # An entry carries Ticket {Id, Number, Title} and NO client at all, so a
+    # per-client figure has to resolve the ticket. The reserved fixture client
+    # has exactly two entries: 3.00h recorded, 3.20h to invoice, 2.00h billable.
+    wing = s.call("gorelo_time_report", assignee="anyone", days=400, client="Wingtip")
+    check("the client resolution is named, and costs one sweep rather than N fetches",
+          "Entries carry no client" in wing and "ClientIds" in wing, wing[:700])
+    check("per-client totals are exact",
+          "3.00h recorded" in wing and "3.20h to invoice" in wing
+          and "2.00h billable" in wing, wing[:900])
+    narrow = s.call("gorelo_time_report", assignee="anyone", days=3, client="Wingtip")
+    check("the window is enforced locally, because the endpoint ignores the filter",
+          "2.00h recorded" in narrow and "IGNORED" in narrow, narrow[:800])
+    check("the unverified window parameter says so rather than pretending",
+          "unverified" in narrow, narrow[:800])
+
+    alex = s.call("gorelo_time_report", assignee="alex", days=400, group_by="technician")
+    check("an assignee filter keeps only that technician's own entries",
+          "Alex Kim" in alex and "Sam Rivers" not in alex, alex[:900])
+
     capped = s.call("gorelo_time_report", assignee="anyone", days=400, limit=2)
-    check("an inspection cap is stated loudly, not silently applied",
-          "were NOT inspected" in capped, capped[-300:])
+    check("an entry cap is stated loudly, not silently applied",
+          "were NOT included" in capped, capped[-300:])
+
+    print("\ncontracts - API 'contract' is the UI's 'Contract Group'")
+    ct = s.call("gorelo_list_contracts")
+    check("the API/UI terminology inversion is stated on every run",
+          'API "contract" = UI "Contract Group"' in ct
+          and 'API "ServiceLine" = UI "Contract"' in ct, ct[:400])
+    check("service lines are listed under their contract group",
+          "Managed Desktop - 42 seats" in ct and "Backup Monitoring" in ct, ct[:900])
+    check("recurring amount, cost and margin are shown and totalled",
+          "27140.00" in ct and "16440.00" in ct and "10700.00" in ct, ct[-300:])
+    check("a contract group with no service lines is flagged, not shown as normal",
+          "NO SERVICE LINES" in ct, ct[:1200])
+    one = s.call("gorelo_list_contracts", client="Contoso")
+    check("contracts filter by client",
+          "Contoso Backup and DR" in one and "Northwind" not in one, one[:400])
+    expired = s.call("gorelo_list_contracts", status="expired")
+    check("contracts filter on a status name fragment, locally",
+          "Tailspin Hardware Lease" in expired and "5001" not in expired, expired[:400])
+
+    print("\nbilling roles and work types")
+    br = s.call("gorelo_billing_roles")
+    check("billing roles carry the sell rate, COA code and tax",
+          "Service Desk Engineer" in br and "165.00" in br and "GST on Income" in br, br)
+    check("the rate is tied to ADJUSTED hours, not recorded ones", "ADJUSTED hours" in br, br)
+    wt = s.call("gorelo_work_types")
+    check("multiplier and per-entry minimum are both shown",
+          "2.50x" in wt and "Min mins" in wt, wt[:600])
+    check("the two fields that change the invoice are explained, not just printed",
+          "change the invoice without changing the recorded hours" in wt
+          and "15-minute floor per entry" in wt, wt[-500:])
+    check("the out-of-hours default work type is identified",
+          "After Hours" in wt and "YES" in wt, wt[:800])
+
+    print("\nindividual time entries")
+    te = s.call("gorelo_list_time_entries", ticket="G-1000", days=30)
+    # The case the old report got wrong: two people logged time on one ticket,
+    # and all of it used to be attributed to the lead assignee.
+    check("two technicians on one ticket are listed separately",
+          "Sam Rivers" in te and "Alex Kim" in te and "2 time entr(ies)" in te, te[:500])
+    check("hours are per entry, not a per-ticket total",
+          "1.75h  2.00h" in te and "0.50h  0.60h" in te, te[:1000])
+    check("the technician's own comment survives", "Assisted with the mailbox" in te, te[:1000])
+    check("service line is labelled with the UI's word for it too",
+          "service line (UI: contract)" in te, te[:1000])
+    mine = s.call("gorelo_list_time_entries", ticket="G-1000", user="alex", days=30)
+    check("a per-user filter works on a ticket led by somebody else",
+          "Alex Kim" in mine and "Sam Rivers" not in mine, mine[:500])
+    nb = s.call("gorelo_list_time_entries", days=400, billable="other", limit=5)
+    check("non-billable entries can be isolated",
+          "non-billable only" in nb and "0.00h billable" in nb, nb[:400])
+    empty = s.call("gorelo_list_time_entries", ticket="G-999999", days=30)
+    check("an empty result says how many rows it looked at",
+          "No time entries" in empty and "came back from /v1/time-entries" in empty, empty)
 
     print("\nresponse times")
     rr = s.call("gorelo_response_report", days=400, assignee="anyone", target_minutes=60)
@@ -228,8 +321,9 @@ def run_suite():
           "method" not in next(t for t in tools
                                if t["name"] == "gorelo_api_probe")["inputSchema"]["properties"])
     # 404 = no such route. 405 = the route exists but not for GET. Conflating
-    # them would have concluded that time-entry endpoints do not exist, when in
-    # fact they exist and are simply not readable.
+    # them concluded that time entries could not be read at all - which was
+    # never what a 405 on ONE path meant, and which /v1/time-entries disproved
+    # on 2026-09-04. A 405 maps a path and a verb, never a capability.
     m405 = s.call("gorelo_api_probe",
                   path="/v1/tickets/00000000-0000-0000-0000-000000001000/time-entries/abc")
     check("405 is explained as 'route exists, wrong verb', not treated as absent",

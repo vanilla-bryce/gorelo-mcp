@@ -20,6 +20,10 @@ break things:
   * unknown query parameters are ignored rather than rejected, so a wrong
     name looks like a successful call that returns everything
   * 429 rate limiting with a retry_after
+  * /v1/time-entries (added by Gorelo on 2026-09-04) is cursor-paginated and
+    IGNORES every filter it is given, so a window has to be applied locally
+  * an API `contract` is what the web UI calls a "Contract Group", and its
+    `ServiceLines` are what the UI calls "Contracts" - inverted, on purpose
 
 Run it:  python3 mock_gorelo.py        (listens on 127.0.0.1:8899)
 """
@@ -272,6 +276,164 @@ for _t in TICKETS:
             }}
         break
 
+# --- the 2026-09-04 release ----------------------------------------------
+# /v1/time-entries, /v1/contracts, /v1/billing-roles and /v1/work-types.
+#
+# TERMINOLOGY, and it is inverted from Gorelo's own web UI: a /v1/contracts
+# record is what the UI calls a CONTRACT GROUP (the invoice), and each of its
+# ServiceLines is what the UI calls a CONTRACT. The fixtures below are named
+# the API way, because that is what a client of this API actually receives.
+
+BILLING_ROLES = [
+    {"Id": 1, "Name": "Service Desk Engineer", "HourlyRate": 165.00,
+     "CoaCode": "200", "Tax": "GST on Income"},
+    {"Id": 2, "Name": "Project Consultant", "HourlyRate": 245.00,
+     "CoaCode": "201", "Tax": "GST on Income"},
+]
+
+WORK_TYPES = [
+    {"Id": 1, "Name": "Remote Support", "HourlyMultiplier": 1.0,
+     "IsDefaultOutsideBusinessHours": False,
+     "BillableStatus": {"Id": 1, "Name": "Billable"},
+     "CoaCode": "200", "Tax": "GST on Income", "MinimumTimeInMinutes": 15},
+    {"Id": 2, "Name": "Onsite Attendance", "HourlyMultiplier": 1.0,
+     "IsDefaultOutsideBusinessHours": False,
+     "BillableStatus": {"Id": 1, "Name": "Billable"},
+     "CoaCode": "200", "Tax": "GST on Income", "MinimumTimeInMinutes": 30},
+    # The two that change the invoice without changing the recorded hours.
+    {"Id": 3, "Name": "After Hours", "HourlyMultiplier": 1.5,
+     "IsDefaultOutsideBusinessHours": True,
+     "BillableStatus": {"Id": 1, "Name": "Billable"},
+     "CoaCode": "200", "Tax": "GST on Income", "MinimumTimeInMinutes": 60},
+    {"Id": 4, "Name": "Public Holiday", "HourlyMultiplier": 2.5,
+     "IsDefaultOutsideBusinessHours": False,
+     "BillableStatus": {"Id": 1, "Name": "Billable"},
+     "CoaCode": "200", "Tax": "GST on Income", "MinimumTimeInMinutes": 60},
+    {"Id": 5, "Name": "Internal / Admin", "HourlyMultiplier": 1.0,
+     "IsDefaultOutsideBusinessHours": False,
+     "BillableStatus": {"Id": 2, "Name": "Not Billable"},
+     "CoaCode": "", "Tax": "", "MinimumTimeInMinutes": 0},
+]
+
+CONTRACTS = [
+    {"Id": 5001, "Name": "Northwind Managed Services", "Status": {"Id": 1, "Name": "Active"},
+     "ClientId": 11001, "LocationIds": [], "CreatedOn": ago(400), "UpdatedOn": ago(21),
+     "Reference": "NW-MSA-2026", "StartDate": "2026-01-01T00:00:00Z",
+     "EndDate": "2026-12-31T00:00:00Z", "RepeatPeriod": {"Id": 3, "Name": "Monthly"},
+     "RecurringAmount": 4850.00, "RecurringCost": 2100.00,
+     "ServiceLines": [
+         {"Id": 9001, "Name": "Managed Desktop - 42 seats", "CreatedOn": ago(400)},
+         {"Id": 9002, "Name": "Managed Server - 4 hosts", "CreatedOn": ago(400)},
+         {"Id": 9003, "Name": "Backup Monitoring", "CreatedOn": ago(180)},
+     ]},
+    {"Id": 5002, "Name": "Contoso Backup and DR", "Status": {"Id": 1, "Name": "Active"},
+     "ClientId": 11002, "LocationIds": [], "CreatedOn": ago(300), "UpdatedOn": ago(9),
+     "Reference": "CE-BDR-02", "StartDate": "2026-03-01T00:00:00Z", "EndDate": None,
+     "RepeatPeriod": {"Id": 3, "Name": "Monthly"},
+     "RecurringAmount": 1290.00, "RecurringCost": 640.00,
+     "ServiceLines": [
+         {"Id": 9010, "Name": "Offsite Backup - 2 TB", "CreatedOn": ago(300)},
+         {"Id": 9011, "Name": "DR Test - annual", "CreatedOn": ago(300)},
+     ]},
+    # A contract group with NO service lines: in the UI, a Contract Group with
+    # no Contracts under it. It invoices nothing and looks fine from outside.
+    {"Id": 5003, "Name": "Fabrikam Project Retainer", "Status": {"Id": 2, "Name": "Draft"},
+     "ClientId": 11003, "LocationIds": [], "CreatedOn": ago(45), "UpdatedOn": ago(45),
+     "Reference": "", "StartDate": "2026-10-01T00:00:00Z", "EndDate": None,
+     "RepeatPeriod": {"Id": 4, "Name": "Quarterly"},
+     "RecurringAmount": 9000.00, "RecurringCost": 4200.00,
+     "ServiceLines": []},
+    {"Id": 5004, "Name": "Tailspin Hardware Lease", "Status": {"Id": 3, "Name": "Expired"},
+     "ClientId": 11004, "LocationIds": [], "CreatedOn": ago(1100), "UpdatedOn": ago(70),
+     "Reference": "TF-LEASE-1", "StartDate": "2023-07-01T00:00:00Z",
+     "EndDate": "2026-06-30T00:00:00Z", "RepeatPeriod": {"Id": 5, "Name": "Annually"},
+     "RecurringAmount": 12000.00, "RecurringCost": 9500.00,
+     "ServiceLines": [{"Id": 9020, "Name": "Leased laptops x 12", "CreatedOn": ago(1100)}]},
+]
+
+BILLABLE = {"Id": 1, "Name": "Billable"}
+NOT_BILLABLE = {"Id": 2, "Name": "Not Billable"}
+NO_CHARGE = {"Id": 3, "Name": "No Charge"}
+
+USER_NAMES = {ME: "Sam Rivers", OTHER: "Alex Kim"}
+
+# One client is held back from the bulk generator so a per-client total is
+# exactly predictable. An entry carries its TICKET but NOT its client, so this
+# is what proves the ticket-to-client resolution actually works.
+RESERVED_CLIENT = 11006          # Wingtip Property Group
+
+TIME_ENTRIES = []
+
+
+def add_entry(ticket, user, actual, adjusted, billable, work_type, role,
+              service_line, days_ago, comment):
+    started = NOW - timedelta(days=days_ago, hours=3)
+    ended = started + timedelta(hours=actual)
+    TIME_ENTRIES.append({
+        "Id": "te-%05d" % (len(TIME_ENTRIES) + 1),
+        "Ticket": {"Id": ticket["Id"], "Number": ticket["Number"],
+                   "Title": ticket["Title"]},
+        "Task": None,
+        "User": {"Id": user, "Name": USER_NAMES[user]},
+        "StartedOn": started.isoformat().replace("+00:00", "Z"),
+        "EndedOn": ended.isoformat().replace("+00:00", "Z"),
+        "ActualHours": actual, "AdjustedHours": adjusted,
+        "BillableStatus": billable,
+        "BillingRole": {"Id": role["Id"], "Name": role["Name"]},
+        "WorkType": {"Id": work_type["Id"], "Name": work_type["Name"]},
+        "ServiceLine": service_line,
+        "Comment": comment, "Distance": 0, "Attachments": [],
+        "CreatedOn": started.isoformat().replace("+00:00", "Z"),
+        "UpdatedOn": None,
+    })
+
+
+_t_by_number = {t["Number"]: t for t in TICKETS}
+
+# THE CASE THE OLD REPORT GOT WRONG. G-1000 is led by ME, and OTHER logged time
+# on it while assisting. Attributing a ticket's hours to its lead assignee - the
+# only thing possible before /v1/time-entries existed - books Alex's 0.50h
+# against Sam. Two entries, two users, one ticket, and nothing else on G-1000.
+add_entry(_t_by_number[1000], ME, 1.75, 2.00, BILLABLE, WORK_TYPES[0],
+          BILLING_ROLES[0], {"Id": 9001, "Name": "Managed Desktop - 42 seats"},
+          1, "Rebuilt the mail profile and tested send/receive.")
+add_entry(_t_by_number[1000], OTHER, 0.50, 0.60, BILLABLE, WORK_TYPES[0],
+          BILLING_ROLES[0], {"Id": 9001, "Name": "Managed Desktop - 42 seats"},
+          1, "Assisted with the mailbox permissions while Sam was on site.")
+
+# The reserved client, with exactly two entries: 3.00h recorded, 3.20h to
+# invoice, 2.00h billable - and one of them outside a 3-day window.
+_wingtip = next(t for t in TICKETS if t["ClientId"] == RESERVED_CLIENT)
+add_entry(_wingtip, ME, 2.00, 2.00, BILLABLE, WORK_TYPES[1], BILLING_ROLES[1],
+          {"Id": 9030, "Name": "Ad hoc project work"}, 2,
+          "Switch replacement at the front office.")
+add_entry(_wingtip, OTHER, 1.00, 1.20, NOT_BILLABLE, WORK_TYPES[4],
+          BILLING_ROLES[0], None, 100,
+          "Internal handover notes - written off.")
+
+# Bulk entries, enough to force cursor pagination at the default PageSize of
+# 200. Deliberately mixed BillableStatus, so realisation is never a flattering
+# 100%.
+_bulk = [t for t in TICKETS
+         if t["Status"]["Id"] != 5
+         and t["ClientId"] != RESERVED_CLIENT
+         and t["Number"] != 1000]
+for _i, _t in enumerate(_bulk):
+    for _j in range(4):
+        _k = _i + _j
+        _user = ME if _k % 3 else OTHER
+        _status = (NOT_BILLABLE if _k % 4 == 2 else
+                   NO_CHARGE if _k % 4 == 3 else BILLABLE)
+        _actual = 0.25 + (_k % 8) * 0.25
+        _adjusted = round(_actual + 0.10, 2) if _status is BILLABLE else _actual
+        add_entry(_t, _user, _actual, _adjusted, _status,
+                  WORK_TYPES[_k % len(WORK_TYPES)],
+                  BILLING_ROLES[_k % len(BILLING_ROLES)],
+                  {"Id": 9001 + (_k % 3), "Name": "Managed Desktop - 42 seats"}
+                  if _status is BILLABLE else None,
+                  (_i * 4 + _j) % 118 + 1,
+                  "Worked item %d on %s" % (_j + 1, _t["DisplayNumber"]))
+
 MINE_UNCLOSED_LEAD = [t for t in TICKETS
                       if t["LeadAssigneeId"] == ME
                       and t["Status"]["Id"] not in (4, 5)]
@@ -432,6 +594,34 @@ class Handler(BaseHTTPRequestHandler):
             rows, pag = paginate(CLIENTS, q)
             return self.reply(200, env(rows, pag))
 
+        # --- the 2026-09-04 release ------------------------------------
+        # /v1/time-entries/statuses is a 404 on the real API. It is asserted
+        # here so nobody invents it from the pattern of the other endpoints.
+        if path == "/v1/time-entries/statuses":
+            return self.reply(404, fail(404, "No route /v1/time-entries/statuses"))
+
+        if path == "/v1/time-entries":
+            # Cursor-paginated, and it IGNORES every query parameter it is
+            # given - exactly as the real API ignores names it does not
+            # recognise. A tool that trusts a server-side window filter here
+            # reports the wrong window and never finds out; one that filters
+            # locally is unaffected. That is the whole point of this route.
+            rows, pag = paginate(TIME_ENTRIES, q)
+            return self.reply(200, env(rows, pag))
+
+        if path == "/v1/contracts":
+            rows, pag = paginate(CONTRACTS, q)
+            return self.reply(200, env(rows, pag))
+
+        # Small reference tables: a bare array with NO Pagination node at all,
+        # which is its own test - get_all must stop after one page rather than
+        # spin looking for a cursor.
+        if path == "/v1/billing-roles":
+            return self.reply(200, env(BILLING_ROLES))
+
+        if path == "/v1/work-types":
+            return self.reply(200, env(WORK_TYPES))
+
         if path == "/v1/contacts":
             rows = CONTACTS
             if "ClientId" in q:               # singular only, as in real Gorelo
@@ -535,8 +725,10 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print("mock gorelo on 127.0.0.1:%d" % PORT, file=sys.stderr)
-    print("  %d tickets, %d clients, %d agents" %
-          (len(TICKETS), len(CLIENTS), len(AGENTS)), file=sys.stderr)
+    print("  %d tickets, %d clients, %d agents, %d time entries" %
+          (len(TICKETS), len(CLIENTS), len(AGENTS), len(TIME_ENTRIES)), file=sys.stderr)
+    print("  %d contract groups (UI: 'contract groups'), %d billing roles, %d work types"
+          % (len(CONTRACTS), len(BILLING_ROLES), len(WORK_TYPES)), file=sys.stderr)
     print("  expected: %d unclosed led by user %d, +9 assisting, "
           "14 merged excluded, 2 unlisted-status" %
           (len(MINE_UNCLOSED_LEAD), ME), file=sys.stderr)

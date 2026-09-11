@@ -10,7 +10,7 @@
 #   GORELO_API_KEY       required
 #   GORELO_MY_EMAIL      required for assignee "me"
 #   GORELO_BASE_URL      default https://api.aue.gorelo.io
-#   GORELO_ALLOW_WRITES  "true" enables the single write tool. Default off.
+#   GORELO_ALLOW_WRITES  "true" enables the two write tools. Default off.
 #
 # stdout is the MCP transport. Diagnostics go to stderr, always.
 
@@ -50,7 +50,19 @@ server = McpStdio::Server.new(
     are real outstanding work and are NOT closed. When counting a backlog, use
     status "open" (active + solved base) rather than "active".
 
-    Only gorelo_add_ticket_comment writes, and it is off unless explicitly enabled.
+    TIME. Since Gorelo's 2026-09-04 release, GET /v1/time-entries returns one row per
+    logged entry with the user who logged it, so per-technician hours from
+    gorelo_time_report are EXACT - not attributed to a ticket's lead assignee, as they
+    were before. Whether an hour can be invoiced is decided by the entry's own
+    BillableStatus; never re-derive it from the work type or the contract.
+
+    CONTRACTS, and the wording is inverted from Gorelo's own web UI. An API "contract"
+    (gorelo_list_contracts) is what the UI calls a CONTRACT GROUP - the invoice - and an
+    API "ServiceLine" is what the UI calls a CONTRACT. Say both when reporting one, or
+    the user will compare it to their screen and conclude the data is wrong.
+
+    Only gorelo_add_ticket_comment and gorelo_update_ticket write, and both are off
+    unless explicitly enabled.
   TEXT
 )
 

@@ -90,6 +90,10 @@ module GoreloTools
     billing_review(server, api)
     time_report(server, api)
     response_report(server, api)
+    list_contracts(server, api)
+    billing_roles(server, api)
+    work_types(server, api)
+    list_time_entries(server, api)
     add_ticket_comment(server, api)
     update_ticket(server, api)
     api_probe(server, api)
@@ -861,118 +865,245 @@ module GoreloTools
 
   # ---- 8. time report -----------------------------------------------------
 
-  # WHAT THIS CANNOT DO, stated up front because it shapes everything below:
-  # Gorelo's API has NO time-entry endpoint. The whole public surface is
-  # fourteen paths and none of them expose a timesheet, a work entry, or hours
-  # by user. Confirmed against the OpenAPI spec, not inferred from a 404.
+  # REWRITTEN 2026-09-11, and the warning this tool used to print on every run
+  # has been deleted with the behaviour that made it true.
   #
-  # The only time data that exists is a per-TICKET total on
-  # GET /v1/tickets/{id}, added 2026-08-21. So "technician time" here means
-  # ticket hours attributed to each ticket's LEAD ASSIGNEE - which counts an
-  # assisting technician's hours against the lead. That is a real limitation,
-  # not a rounding error, and the report says so every time rather than
-  # presenting an approximation as a measurement.
+  # WHAT IT USED TO SAY, and why it was right at the time: before Gorelo's
+  # 4 September 2026 release there was no readable time-entry endpoint. The
+  # only hours in the API were a per-TICKET total on GET /v1/tickets/{id}, so
+  # this tool fetched one ticket per request and booked every hour on it to
+  # that ticket's LEAD assignee. Time logged by an assisting technician was
+  # therefore reported against somebody else, and the tool said so.
   #
-  # What it IS good for: realisation - what fraction of recorded hours are
-  # billable - which is a ratio, and survives the attribution problem far
-  # better than a per-person total does.
+  # WHAT CHANGED: GET /v1/time-entries returns one row per logged entry,
+  # tenant-wide, each carrying the User who logged it. Per-technician totals
+  # are now EXACT, and the report is one paged sweep instead of N+1 requests.
+  #
+  # THE ONE THING AN ENTRY DOES NOT CARRY IS A CLIENT. It has
+  # Ticket {Id, Number, Title} and nothing else about who the work was for, so
+  # anything grouped or filtered by client goes through
+  # Gorelo::Client#ticket_client_index - a single paged sweep of /v1/tickets -
+  # rather than a fetch per entry. The reply states what that cost.
+
+  # The entry's OWN BillableStatus is what Gorelo's invoice run follows, so it
+  # is never re-derived here from the work type, the billing role or the
+  # contract: a technician can override it on the entry, and the override is
+  # the truth. Every status name seen is printed with its hours so that this
+  # one-line judgement is always visible rather than assumed.
+  def billable_entry?(entry)
+    nested(entry, 'BillableStatus', 'Name').to_s.strip.downcase.start_with?('billable')
+  end
+
+  def entry_started_at(entry)
+    raw = entry['StartedOn'] || entry['CreatedOn']
+    return nil if raw.nil? || raw.to_s.empty?
+
+    Time.parse(raw.to_s).utc
+  rescue ArgumentError
+    nil
+  end
+
+  # UNVERIFIED PARAMETER NAME. /v1/tickets documents CreatedSince / UpdatedSince;
+  # whether /v1/time-entries accepts either, accepts something else, or accepts
+  # no window filter at all has NOT been confirmed against the spec, and this
+  # server does not guess against a live tenant to find out. The API also
+  # IGNORES query parameters it does not recognise rather than rejecting them,
+  # so a wrong name returns the full unfiltered set and looks exactly like a
+  # working filter.
+  #
+  # The guess is therefore only ever allowed to make the call CHEAPER, never to
+  # decide what ends up in the report:
+  #
+  #   * the window is applied LOCALLY on StartedOn, always;
+  #   * the value sent is padded two weeks earlier than the window, so an entry
+  #     created before the window for work done inside it cannot be lost if the
+  #     filter IS honoured;
+  #   * if the endpoint rejects the parameter outright, the call is retried
+  #     without it.
+  #
+  # The reply says which of those three happened, so the first person to run
+  # this against a tenant learns the answer instead of inheriting the guess.
+  TIME_WINDOW_PARAM    = 'CreatedSince'
+  TIME_WINDOW_PAD_DAYS = 14
+
+  def fetch_time_entries(api, since)
+    padded = since - (TIME_WINDOW_PAD_DAYS * 86_400)
+
+    rows = begin
+      api.get_all('/v1/time-entries', { TIME_WINDOW_PARAM => padded.strftime('%Y-%m-%d') })
+    rescue Gorelo::AuthError
+      raise
+    rescue Gorelo::Error
+      return [api.get_all('/v1/time-entries'), :rejected]
+    end
+
+    outside = rows.any? do |e|
+      raw = e['CreatedOn']
+      next false if raw.nil? || raw.to_s.empty?
+
+      (Time.parse(raw.to_s).utc < padded rescue false)
+    end
+    [rows, outside ? :ignored : :applied]
+  end
+
+  def window_note(state)
+    case state
+    when :rejected
+      "#{TIME_WINDOW_PARAM} was REJECTED by /v1/time-entries, so the whole entry history " \
+        'was paged and the window applied locally.'
+    when :ignored
+      "#{TIME_WINDOW_PARAM} was IGNORED by /v1/time-entries (rows older than it came back), " \
+        'so the whole entry history was paged and the window applied locally. The parameter ' \
+        'name is unverified - see the comment above fetch_time_entries.'
+    else
+      "#{TIME_WINDOW_PARAM} (padded #{TIME_WINDOW_PAD_DAYS}d) was sent and nothing older came " \
+        'back - which is consistent with the filter being applied AND with there simply being ' \
+        'no older entries, so it is not proof either way. The parameter name is unverified; ' \
+        'the window is enforced locally on StartedOn regardless.'
+    end
+  end
+
   def time_report(server, api)
     server.tool(
       name:  'gorelo_time_report',
       title: 'Report recorded time and realisation',
       description: <<~TEXT,
-        Recorded hours, invoiceable hours and the billable share, over a window, grouped by
+        Recorded hours, invoiceable hours and the billable share over a window, grouped by
         technician or client.
 
-        ⚠ Gorelo has NO per-user time API - the entire spec is 14 paths and none expose
-        timesheets. Hours are per TICKET and are attributed here to the ticket's LEAD
-        assignee, so an assisting technician's time counts against the lead. The reply
-        states how many tickets that affects. Treat per-person totals as indicative and
-        the REALISATION percentage as the reliable number.
+        Built from GET /v1/time-entries - one row per logged entry, each carrying the USER who
+        logged it - so PER-PERSON TOTALS ARE EXACT, including time logged by someone assisting
+        on another technician's ticket. (Before Gorelo's 4 September 2026 release this tool read
+        per-TICKET totals and booked them all to the lead assignee, and warned that per-person
+        figures were only indicative. That warning is gone because the limitation is.)
 
-        COST AND TIME: one request per ticket, because the breakdown exists only on the
-        get-by-id endpoint. 500+ tickets are updated org-wide in a typical month, so scope
-        it - by assignee, by client, or with a short window - and expect roughly a second
-        per ticket. The reply states the request count.
+        REALISATION is AdjustedHours / ActualHours - what survived Gorelo's 6-minute rounding
+        and any write-down. BILL% is the invoiceable share whose own BillableStatus says
+        billable. The entry decides that; it is never re-derived from the work type or the
+        contract. Every BillableStatus seen is listed with its hours, so nothing is classified
+        out of sight.
+
+        COST: one paged sweep of /v1/time-entries. An entry names its TICKET but NOT its
+        CLIENT, so grouping or filtering by client costs one extra paged sweep of /v1/tickets
+        to build a ticket-to-client index - never a fetch per entry. Grouping by technician
+        with no client filter costs nothing beyond the entries themselves. The reply states the
+        measured request count.
       TEXT
       input_schema: {
         type: 'object',
         properties: {
-          days:     { type: 'integer', description: 'Window in days, matched on the ticket UpdatedOn date. Default 30.' },
-          assignee: { type: 'string', description: 'Gorelo user id, email, name fragment, or "me". Use "anyone" to cover the organisation. Default "me".' },
-          client:   { type: 'string', description: 'Restrict to one or more clients (name fragment, comma-separated).' },
+          days:     { type: 'integer', description: "Window in days, matched locally on each entry's StartedOn. Default 30." },
+          assignee: { type: 'string', description: 'Whose entries: Gorelo user id, email, name fragment, or "me". Use "anyone" to cover the organisation. Default "me".' },
+          client:   { type: 'string', description: 'Restrict to one or more clients (name fragment, comma-separated). Costs one extra paged sweep of /v1/tickets, because entries carry no client.' },
           group_by: { type: 'string', enum: %w[technician client], description: 'Default "client" for one technician, "technician" for "anyone".' },
-          limit:    { type: 'integer', description: 'Max tickets to inspect - each costs a request. Default 150.' }
+          limit:    { type: 'integer', description: 'Max time entries to include. Default 5000. Entries no longer cost a request each, so this is a safety valve rather than a tuning knob - and any cap it applies is stated loudly.' }
         },
         additionalProperties: false
       }
     ) do |args|
-      days  = (args['days'] || 30).to_i.clamp(1, 400)
-      limit = (args['limit'] || 150).to_i.clamp(1, 400)
-      since = (Time.now.utc - (days * 86_400)).strftime('%Y-%m-%d')
+      days    = (args['days'] || 30).to_i.clamp(1, 400)
+      limit   = (args['limit'] || 5000).to_i.clamp(1, 50_000)
+      since   = Time.now.utc - (days * 86_400)
+      started = api.requests
 
-      query    = { 'UpdatedSince' => since }
-      scope    = ["last #{days}d"]
+      all_rows, window_state = fetch_time_entries(api, since)
+      scope = ["last #{days}d"]
+
+      # An entry with an unreadable date is KEPT and counted separately. Dropping
+      # it would quietly shrink somebody's week.
+      undated = 0
+      rows = all_rows.select do |e|
+        at = entry_started_at(e)
+        if at.nil?
+          undated += 1
+          true
+        else
+          at >= since
+        end
+      end
+      in_window = rows.size
+
       assignee = args['assignee'] || 'me'
       org_wide = assignee.to_s.downcase == 'anyone'
-
       unless org_wide
-        query['LeadAssigneeIds'] = api.resolve_user_id(assignee).to_s
+        uid  = api.resolve_user_id(assignee)
+        rows = rows.select { |e| nested(e, 'User', 'Id').to_s == uid.to_s }
         scope << "assignee=#{assignee}"
       end
 
+      group_by = args['group_by'] || (org_wide ? 'technician' : 'client')
+
+      # How the client gets resolved, stated plainly because it is the one place
+      # this report spends requests it does not strictly have to.
+      index      = nil
+      index_note = 'No client lookup was needed, so the entries were the only requests.'
       if args['client'] && !args['client'].to_s.empty?
         matched = api.resolve_clients(args['client'])
         next "No client matches #{args['client'].inspect}." if matched.empty?
 
-        query['ClientIds'] = matched.map { |c| c['Id'] }.join(',')
+        tickets = api.get_all('/v1/tickets',
+                              { 'ClientIds' => matched.map { |c| c['Id'] }.join(',') })
+        index = tickets.each_with_object({}) { |t, h| h[t['Id'].to_s] = t['ClientId'] }
+        rows  = rows.select { |e| index.key?(nested(e, 'Ticket', 'Id').to_s) }
         scope << "client=#{matched.map { |c| c['Name'] }.first(3).join(' + ')}"
+        index_note = "Entries carry no client, so the named client's #{tickets.size} ticket(s) " \
+                     'were fetched once with ClientIds and the entries matched on Ticket.Id.'
+      elsif group_by == 'client'
+        index = api.ticket_client_index
+        index_note = "Entries carry no client, so all #{index.size} ticket(s) were indexed by " \
+                     'ONE paged sweep of /v1/tickets (cached for this process), not one fetch ' \
+                     'per entry.'
       end
 
-      rows = api.get_all('/v1/tickets', query).reject { |t| merged?(t) }
       if rows.empty?
-        next "No tickets #{scope.join(', ')}."
+        next "No time entries #{scope.join(', ')}. " \
+             "#{all_rows.size} entry row(s) came back from /v1/time-entries; " \
+             "#{in_window} fell inside the window.\n#{window_note(window_state)}"
       end
 
-      inspected  = rows.first(limit)
-      with_assist = inspected.count { |t| Array(t['AssistingAssigneeIds']).any? }
-      calls = 0
-      buckets = Hash.new { |h, k| h[k] = { actual: 0.0, adjusted: 0.0, billable: 0.0, tickets: 0 } }
-      totals  = { actual: 0.0, adjusted: 0.0, billable: 0.0 }
-      biggest = []
+      included = rows.first(limit)
 
-      group_by = args['group_by'] || (org_wide ? 'technician' : 'client')
+      buckets  = Hash.new do |h, k|
+        h[k] = { entries: 0, tickets: Set.new, actual: 0.0, adjusted: 0.0, billable: 0.0 }
+      end
+      statuses   = Hash.new { |h, k| h[k] = { entries: 0, adjusted: 0.0 } }
+      per_ticket = {}
+      totals     = { actual: 0.0, adjusted: 0.0, billable: 0.0 }
 
-      inspected.each_with_index do |t, i|
-        server.log("time report: #{i + 1}/#{inspected.size} tickets inspected") if ((i + 1) % 25).zero?
-        detail = begin
-          calls += 1
-          api.get("/v1/tickets/#{t['Id']}")['Data']
-        rescue Gorelo::Error
-          nil
-        end
-        next unless detail.is_a?(Hash)
-
-        time = detail['Time'] || {}
-        act  = time['ActualHours'].to_f
-        adj  = time['AdjustedHours'].to_f
-        bil  = nested(time, 'Breakdown', 'Billable', 'AdjustedHours').to_f
-        next if act.zero? && adj.zero?
+      included.each do |e|
+        act = e['ActualHours'].to_f
+        adj = e['AdjustedHours'].to_f
+        bil = billable_entry?(e) ? adj : 0.0
+        tid = nested(e, 'Ticket', 'Id').to_s
 
         key = if group_by == 'technician'
-                api.user_name(t['LeadAssigneeId']) || "user #{t['LeadAssigneeId']}"
+                nested(e, 'User', 'Name') || api.user_name(nested(e, 'User', 'Id')) ||
+                  "user #{nested(e, 'User', 'Id')}"
               else
-                api.client_name(t['ClientId']) || (t['ClientId'] ? "client #{t['ClientId']}" : '⚠ NO CLIENT')
+                cid = index && index[tid]
+                cid ? (api.client_name(cid) || "client #{cid}") : "⚠ CLIENT UNRESOLVED"
               end
+
         b = buckets[key]
-        b[:actual] += act
+        b[:entries]  += 1
+        b[:tickets]  << tid
+        b[:actual]   += act
         b[:adjusted] += adj
         b[:billable] += bil
-        b[:tickets] += 1
-        totals[:actual] += act
+
+        totals[:actual]   += act
         totals[:adjusted] += adj
         totals[:billable] += bil
-        biggest << [t, act, adj, bil]
+
+        st = statuses[nested(e, 'BillableStatus', 'Name') || '(none)']
+        st[:entries]  += 1
+        st[:adjusted] += adj
+
+        t = (per_ticket[tid] ||= { number: nested(e, 'Ticket', 'Number'),
+                                   title: nested(e, 'Ticket', 'Title'),
+                                   adjusted: 0.0, billable: 0.0 })
+        t[:adjusted] += adj
+        t[:billable] += bil
       end
 
       pct = lambda do |part, whole|
@@ -980,18 +1111,19 @@ module GoreloTools
       end
 
       out = ["Recorded time - #{scope.join(', ')}."]
-      out << "#{rows.size} ticket(s) in scope, #{inspected.size} inspected " \
-             "(#{calls} extra request(s) for the time breakdown); " \
-             "#{buckets.values.sum { |b| b[:tickets] }} of them carry time."
+      out << "#{all_rows.size} time entry row(s) returned, #{in_window} inside the window, " \
+             "#{included.size} included, across #{per_ticket.size} ticket(s). " \
+             "#{api.requests - started} request(s) in total."
+      out << window_note(window_state)
+      out << index_note
       out << ''
-      out << '⚠ Gorelo has no per-user time API. Hours are attributed to each ticket\'s LEAD'
-      out << "  assignee. #{with_assist} of the inspected tickets also have assisting assignees, so"
-      out << '  those hours are counted against the lead. Per-person totals are indicative;'
-      out << '  the realisation percentage is the number to trust.'
+      out << 'Per-person figures are EXACT: every hour is counted against the user named on its'
+      out << 'own time entry, so assisting time lands on whoever actually did it.'
       out << ''
       out << format('TOTAL   %7.2fh recorded   %7.2fh to invoice   %7.2fh billable   ' \
-                    'realisation %s',
+                    'realisation %s   bill%% %s',
                     totals[:actual], totals[:adjusted], totals[:billable],
+                    pct.call(totals[:adjusted], totals[:actual]),
                     pct.call(totals[:billable], totals[:adjusted]))
       if totals[:adjusted] > totals[:actual]
         out << format('        adjusted UP by %.2fh across the window', totals[:adjusted] - totals[:actual])
@@ -1001,36 +1133,54 @@ module GoreloTools
 
       out << ''
       out << "By #{group_by}"
-      out << "#{'Tkts'.rjust(5)}#{'Recorded'.rjust(11)}#{'Invoice'.rjust(11)}" \
-             "#{'Billable'.rjust(11)}#{'Real.'.rjust(7)}  #{group_by.capitalize}"
-      out << ('-' * 96)
+      out << "#{'Ents'.rjust(5)}#{'Tkts'.rjust(6)}#{'Recorded'.rjust(11)}#{'Invoice'.rjust(11)}" \
+             "#{'Billable'.rjust(11)}#{'Real.'.rjust(7)}#{'Bill%'.rjust(7)}  #{group_by.capitalize}"
+      out << ('-' * 104)
       buckets.sort_by { |_, b| -b[:adjusted] }.each do |name, b|
-        out << "#{b[:tickets].to_s.rjust(5)}#{format('%10.2fh', b[:actual])}" \
-               "#{format('%10.2fh', b[:adjusted])}#{format('%10.2fh', b[:billable])}" \
+        out << "#{b[:entries].to_s.rjust(5)}#{b[:tickets].size.to_s.rjust(6)}" \
+               "#{format('%10.2fh', b[:actual])}#{format('%10.2fh', b[:adjusted])}" \
+               "#{format('%10.2fh', b[:billable])}" \
+               "#{pct.call(b[:adjusted], b[:actual]).rjust(7)}" \
                "#{pct.call(b[:billable], b[:adjusted]).rjust(7)}  #{clip(name, 44)}"
       end
 
-      # Non-billable hours are where the margin actually goes, so name the
-      # worst offenders rather than leaving them inside a percentage.
-      leak = biggest.select { |(_, _, adj, bil)| adj - bil > 0.25 }
-                    .sort_by { |(_, _, adj, bil)| -(adj - bil) }
+      # Which BillableStatus each hour was filed under, so the billable/not
+      # judgement above is never taken on trust.
+      out << ''
+      out << 'BillableStatus on the entries (this is what decides invoiceable, not this tool)'
+      out << ('-' * 104)
+      statuses.sort_by { |_, v| -v[:adjusted] }.each do |name, v|
+        mark = name.to_s.strip.downcase.start_with?('billable') ? 'counted billable' : 'not billable'
+        out << "#{pad(name, 32)}#{format('%7d entr(ies)', v[:entries])}" \
+               "#{format('%10.2fh to invoice', v[:adjusted])}   #{mark}"
+      end
+
+      # Non-billable hours are where the margin actually goes, so name the worst
+      # offenders rather than leaving them inside a percentage.
+      leak = per_ticket.values.select { |t| t[:adjusted] - t[:billable] > 0.25 }
+                       .sort_by { |t| -(t[:adjusted] - t[:billable]) }
       if leak.any?
-        lost = leak.sum { |(_, _, adj, bil)| adj - bil }
+        lost = leak.sum { |t| t[:adjusted] - t[:billable] }
         out << ''
         out << format('NON-BILLABLE - %.2fh across %d ticket(s), largest first', lost, leak.size)
-        out << ('-' * 96)
-        leak.first(12).each do |(t, _act, adj, bil)|
-          out << "#{pad(t['DisplayNumber'] || "G-#{t['Number']}", 10)}" \
-                 "#{pad(api.client_name(t['ClientId']) || '?', 28)}" \
-                 "#{format('%6.2fh', adj - bil)}  #{clip(t['Title'], 48)}"
+        out << ('-' * 104)
+        leak.first(12).each do |t|
+          out << "#{pad("G-#{t[:number]}", 10)}#{format('%6.2fh', t[:adjusted] - t[:billable])}" \
+                 "  #{clip(t[:title], 72)}"
         end
         out << "  … #{leak.size - 12} more" if leak.size > 12
       end
 
-      if rows.size > inspected.size
+      if undated.positive?
         out << ''
-        out << "⚠ #{rows.size - inspected.size} ticket(s) in scope were NOT inspected (limit " \
-               "#{limit}). Every figure above covers only the #{inspected.size} that were."
+        out << "⚠ #{undated} entr(ies) had no readable StartedOn or CreatedOn and were KEPT " \
+               'rather than dropped, so the window may be slightly generous.'
+      end
+
+      if rows.size > included.size
+        out << ''
+        out << "⚠ #{rows.size - included.size} entr(ies) in scope were NOT included (limit " \
+               "#{limit}). Every figure above covers only the #{included.size} that were."
       end
       out.join("\n")
     end
@@ -1281,7 +1431,338 @@ module GoreloTools
     end
   end
 
-  # ---- 8. api probe -------------------------------------------------------
+  # ---- 12. contracts ------------------------------------------------------
+  #
+  # READ THIS BEFORE READING A ROW. Gorelo's API and Gorelo's web UI use the
+  # same two words for different objects, and they are INVERTED:
+  #
+  #     API /v1/contracts   ->  the UI calls this a CONTRACT GROUP (the invoice)
+  #     API ServiceLines[]  ->  the UI calls each of these a CONTRACT
+  #
+  # So one API "contract" is a billing container holding several UI
+  # "contracts". Gorelo has said it intends to align the UI to the API
+  # eventually, which means this mapping will flip rather than disappear.
+  # Until then, anyone comparing this output against their own Gorelo screen
+  # will conclude the data is wrong unless both words appear together - so
+  # both words appear on every run.
+  def list_contracts(server, api)
+    server.tool(
+      name:  'gorelo_list_contracts',
+      title: 'List Gorelo contract groups and their service lines',
+      description: <<~TEXT,
+        Recurring agreements: what each one invoices, what it costs, over what period, for
+        which client - with its service lines underneath.
+
+        ⚠ THE TERMINOLOGY IS INVERTED BETWEEN THE API AND THE UI, and this tool speaks API.
+        One row here is a /v1/contracts record, which Gorelo's web UI calls a CONTRACT GROUP
+        (an invoice). Each indented line under it is a ServiceLine, which the UI calls a
+        CONTRACT. If you compare a row to your Gorelo screen without holding that in mind,
+        correct data will look wrong. Gorelo says the UI will eventually be aligned to the
+        API, so expect the words to swap rather than settle.
+
+        RecurringAmount is what the group bills each period and RecurringCost what it costs,
+        so the gap is the margin - printed per row and totalled. A group with NO service lines
+        is flagged: it is an invoice container with nothing on it.
+      TEXT
+      input_schema: {
+        type: 'object',
+        properties: {
+          client:   { type: 'string', description: 'Client name fragment or id. Comma-separate several terms.' },
+          status:   { type: 'string', description: 'Status NAME fragment, e.g. "active". Matched locally, so a status this tool has never heard of still works.' },
+          include_service_lines: { type: 'boolean', description: 'Show each contract group\'s service lines (what the UI calls contracts) underneath it. Default true.' },
+          limit:    { type: 'integer', description: 'Default 50.' }
+        },
+        additionalProperties: false
+      }
+    ) do |args|
+      limit = (args['limit'] || 50).to_i.clamp(1, 500)
+      all   = api.get_all('/v1/contracts')
+      rows  = all
+      scope = []
+
+      if args['client'] && !args['client'].to_s.empty?
+        matched = api.resolve_clients(args['client'])
+        next "No client matches #{args['client'].inspect}." if matched.empty?
+
+        want = matched.map { |c| c['Id'].to_s }.to_set
+        rows = rows.select { |c| want.include?(c['ClientId'].to_s) }
+        scope << "client=#{matched.map { |c| c['Name'] }.first(3).join(' + ')}"
+      end
+
+      if args['status'] && !args['status'].to_s.empty?
+        needle = args['status'].to_s.downcase
+        rows = rows.select { |c| nested(c, 'Status', 'Name').to_s.downcase.include?(needle) }
+        scope << "status~#{args['status']}"
+      end
+
+      if rows.empty?
+        next "No contract groups match#{scope.empty? ? '' : " (#{scope.join(', ')})"}. " \
+             "#{all.size} contract group(s) in Gorelo."
+      end
+
+      show  = args.fetch('include_service_lines', true)
+      shown = rows.sort_by { |c| -(c['RecurringAmount'].to_f) }.first(limit)
+
+      out = ["#{rows.size} of #{all.size} contract group(s)" \
+             "#{scope.empty? ? '' : " (#{scope.join(', ')})"}."]
+      out << 'API "contract" = UI "Contract Group" (the invoice). ' \
+             'API "ServiceLine" = UI "Contract" (the ↳ lines).'
+      out << ''
+      out << "#{pad('Id', 8)}#{pad('Contract group', 34)}#{pad('Client', 26)}#{pad('Status', 12)}" \
+             "#{pad('Period', 11)}#{'Bills'.rjust(11)}#{'Cost'.rjust(11)}#{'Margin'.rjust(11)}  Lines"
+      out << ('-' * 128)
+
+      bills = cost = 0.0
+      shown.each do |c|
+        amount = c['RecurringAmount'].to_f
+        spend  = c['RecurringCost'].to_f
+        bills += amount
+        cost  += spend
+        lines  = Array(c['ServiceLines'])
+
+        out << "#{pad(c['Id'], 8)}#{pad(c['Name'], 34)}" \
+               "#{pad(api.client_name(c['ClientId']) || (c['ClientId'] ? "client #{c['ClientId']}" : '⚠ NO CLIENT'), 26)}" \
+               "#{pad(nested(c, 'Status', 'Name'), 12)}#{pad(nested(c, 'RepeatPeriod', 'Name'), 11)}" \
+               "#{format('%11.2f', amount)}#{format('%11.2f', spend)}#{format('%11.2f', amount - spend)}" \
+               "  #{lines.size}"
+
+        term = [c['StartDate'], c['EndDate']].map { |d| d.to_s[0, 10] }
+        meta = []
+        meta << "term #{term[0].empty? ? '?' : term[0]} → #{term[1].empty? ? 'open' : term[1]}"
+        meta << "ref #{c['Reference']}" unless c['Reference'].to_s.strip.empty?
+        out << "#{' ' * 8}· #{clip(meta.join(' · '), 110)}"
+
+        if lines.empty?
+          out << "#{' ' * 8}⚠ NO SERVICE LINES - an invoice container with nothing on it. " \
+                 'In the UI this is a Contract Group with no Contracts.'
+        elsif show
+          lines.each do |l|
+            out << "#{' ' * 8}↳ #{pad(l['Id'], 8)}#{clip(l['Name'], 96)}"
+          end
+        end
+      end
+
+      out << ('-' * 128)
+      out << format('TOTAL of the %d shown   bills %.2f   cost %.2f   margin %.2f per period',
+                    shown.size, bills, cost, bills - cost)
+      out << "#{rows.size - shown.size} more not shown - raise limit." if rows.size > shown.size
+      out.join("\n")
+    end
+  end
+
+  # ---- 13. billing roles --------------------------------------------------
+
+  def billing_roles(server, api)
+    server.tool(
+      name:  'gorelo_billing_roles',
+      title: 'List Gorelo billing roles and their rates',
+      description: <<~TEXT,
+        The sell-rate table. Small, unpaginated, and one of the two things that decide what a
+        time entry is worth.
+
+        Every time entry carries a BillingRole. That role's HourlyRate is the rate applied to
+        the entry's ADJUSTED hours - so editing a rate here silently changes the value of
+        every future entry filed under it, across every client, with nothing on the entry to
+        show it moved. Read this table before quoting anyone a rate from memory.
+
+        CoaCode and Tax are the accounting mappings the invoice carries into your ledger; a
+        role with the wrong one invoices correctly and posts wrongly, which is the harder
+        error to spot. Pair this with gorelo_work_types: the role sets the rate, the work type
+        multiplies it.
+      TEXT
+      input_schema: { type: 'object', properties: {}, additionalProperties: false }
+    ) do |_args|
+      rows = api.get_all('/v1/billing-roles')
+      next 'No billing roles returned by /v1/billing-roles.' if rows.empty?
+
+      out = ["#{rows.size} billing role(s). The rate applies to an entry's ADJUSTED hours.", '']
+      out << "#{pad('Id', 8)}#{pad('Name', 34)}#{'Hourly rate'.rjust(12)}  #{pad('CoaCode', 12)}Tax"
+      out << ('-' * 92)
+      rows.sort_by { |r| -r['HourlyRate'].to_f }.each do |r|
+        out << "#{pad(r['Id'], 8)}#{pad(r['Name'], 34)}#{format('%12.2f', r['HourlyRate'].to_f)}  " \
+               "#{pad(r['CoaCode'], 12)}#{clip(r['Tax'], 28)}"
+      end
+      out.join("\n")
+    end
+  end
+
+  # ---- 14. work types -----------------------------------------------------
+
+  def work_types(server, api)
+    server.tool(
+      name:  'gorelo_work_types',
+      title: 'List Gorelo work types, multipliers and minimum times',
+      description: <<~TEXT,
+        The other half of what a time entry bills. Small, unpaginated.
+
+        Two fields here change money, and neither is visible on a time entry once it is
+        logged:
+
+          HourlyMultiplier - scales what the entry is worth against its billing role's rate.
+            1.0 is standard time, 1.5 is time-and-a-half, 2.0 double. A 1-hour entry on a 2.0
+            work type invoices as two hours would. This is why an after-hours callout on the
+            wrong work type quietly halves itself.
+
+          MinimumTimeInMinutes - the floor a single entry bills at. With a 15-minute minimum,
+            a 4-minute entry invoices 15 minutes; six such entries on one ticket bill 90
+            minutes for 24 minutes of work, all of it legitimate and none of it obvious from
+            the recorded hours.
+
+        IsDefaultOutsideBusinessHours marks the work type Gorelo reaches for automatically on
+        an entry logged out of hours - so a wrong default misprices work nobody chose the type
+        for. BillableStatus is this work type's DEFAULT only: the entry's own BillableStatus
+        overrides it, and that is what gorelo_time_report counts.
+      TEXT
+      input_schema: { type: 'object', properties: {}, additionalProperties: false }
+    ) do |_args|
+      rows = api.get_all('/v1/work-types')
+      next 'No work types returned by /v1/work-types.' if rows.empty?
+
+      out = ["#{rows.size} work type(s). Multiplier scales the billing role's rate; " \
+             'minimum is the floor ONE entry bills at.', '']
+      out << "#{pad('Id', 8)}#{pad('Name', 28)}#{'Multiplier'.rjust(11)}#{'Min mins'.rjust(10)}  " \
+             "#{pad('Default status', 18)}#{pad('CoaCode', 10)}Out-of-hours default"
+      out << ('-' * 116)
+      rows.sort_by { |r| -r['HourlyMultiplier'].to_f }.each do |r|
+        status = r['BillableStatus'].is_a?(Hash) ? r['BillableStatus']['Name'] : r['BillableStatus']
+        out << "#{pad(r['Id'], 8)}#{pad(r['Name'], 28)}" \
+               "#{format('%10.2fx', r['HourlyMultiplier'].to_f)}" \
+               "#{r['MinimumTimeInMinutes'].to_i.to_s.rjust(10)}  " \
+               "#{pad(status, 18)}#{pad(r['CoaCode'], 10)}" \
+               "#{r['IsDefaultOutsideBusinessHours'] ? 'YES' : '-'}"
+      end
+
+      flagged = rows.select { |r| r['HourlyMultiplier'].to_f != 1.0 || r['MinimumTimeInMinutes'].to_i > 0 }
+      unless flagged.empty?
+        out << ''
+        out << 'These change the invoice without changing the recorded hours:'
+        flagged.each do |r|
+          bits = []
+          bits << format('%.2fx rate', r['HourlyMultiplier'].to_f) if r['HourlyMultiplier'].to_f != 1.0
+          bits << "#{r['MinimumTimeInMinutes'].to_i}-minute floor per entry" if r['MinimumTimeInMinutes'].to_i > 0
+          out << "  #{pad(r['Name'], 28)}#{bits.join(' · ')}"
+        end
+      end
+      out.join("\n")
+    end
+  end
+
+  # ---- 15. list time entries ----------------------------------------------
+  #
+  # WHY THIS EXISTS BESIDE gorelo_time_report. The report aggregates, and the
+  # fields that matter when a figure is disputed are exactly the ones
+  # aggregation destroys: the Comment describing what was done, the WorkType
+  # and BillingRole that priced it, the ServiceLine it was billed against, and
+  # the start and end times. None of those survive a per-technician total, and
+  # none of them are on a ticket. So this answers "which entries make up that
+  # number, and who typed what" - which the report structurally cannot.
+  def list_time_entries(server, api)
+    server.tool(
+      name:  'gorelo_list_time_entries',
+      title: 'List individual Gorelo time entries',
+      description: <<~TEXT,
+        The raw time entries behind the numbers: one row each, with who logged it, the hours
+        recorded and adjusted, its BillableStatus, work type, billing role, service line and
+        the technician's own comment.
+
+        Use this when a total is being questioned rather than reported. gorelo_time_report
+        aggregates, and aggregation destroys precisely what an argument needs - the comment,
+        the work type that priced the entry, and the service line it was billed against.
+
+        ⚠ SERVICE LINE is API wording. Gorelo's web UI calls a service line a CONTRACT, and
+        calls the /v1/contracts record that holds it a CONTRACT GROUP. See
+        gorelo_list_contracts.
+
+        Costs one paged sweep of /v1/time-entries; filtering happens locally, so no filter
+        here is silently ignored by the API.
+      TEXT
+      input_schema: {
+        type: 'object',
+        properties: {
+          ticket: { type: 'string', description: 'Ticket number such as G-13933, a bare number, or a ticket id. Matched against the entry\'s own Ticket, so it costs no extra request.' },
+          user:   { type: 'string', description: 'Gorelo user id, email, name fragment, or "me". Default: everyone.' },
+          days:   { type: 'integer', description: "Window in days, matched locally on StartedOn. Default 14." },
+          billable: { type: 'string', enum: %w[all billable other], description: 'Filter on the entry BillableStatus. Default "all".' },
+          limit:  { type: 'integer', description: 'Default 60.' }
+        },
+        additionalProperties: false
+      }
+    ) do |args|
+      days  = (args['days'] || 14).to_i.clamp(1, 400)
+      limit = (args['limit'] || 60).to_i.clamp(1, 500)
+      since = Time.now.utc - (days * 86_400)
+
+      all_rows, window_state = fetch_time_entries(api, since)
+      scope = ["last #{days}d"]
+
+      rows = all_rows.select { |e| (at = entry_started_at(e)).nil? || at >= since }
+
+      if args['ticket'] && !args['ticket'].to_s.empty?
+        ref  = args['ticket'].to_s.strip
+        key  = ref.sub(/\AG-/i, '')
+        rows = rows.select do |e|
+          nested(e, 'Ticket', 'Number').to_s == key ||
+            nested(e, 'Ticket', 'Id').to_s.casecmp?(ref)
+        end
+        scope << "ticket=#{ref}"
+      end
+
+      if args['user'] && !args['user'].to_s.empty?
+        uid  = api.resolve_user_id(args['user'])
+        rows = rows.select { |e| nested(e, 'User', 'Id').to_s == uid.to_s }
+        scope << "user=#{args['user']}"
+      end
+
+      case (args['billable'] || 'all').to_s.downcase
+      when 'billable'
+        rows = rows.select { |e| billable_entry?(e) }
+        scope << 'billable only'
+      when 'other'
+        rows = rows.reject { |e| billable_entry?(e) }
+        scope << 'non-billable only'
+      end
+
+      if rows.empty?
+        next "No time entries #{scope.join(', ')}. " \
+             "#{all_rows.size} entry row(s) came back from /v1/time-entries.\n" \
+             "#{window_note(window_state)}"
+      end
+
+      rows = rows.sort_by { |e| entry_started_at(e) || Time.at(0).utc }.reverse
+      act  = rows.sum { |e| e['ActualHours'].to_f }
+      adj  = rows.sum { |e| e['AdjustedHours'].to_f }
+      bill = rows.select { |e| billable_entry?(e) }.sum { |e| e['AdjustedHours'].to_f }
+
+      out = ["#{rows.size} time entr(ies) - #{scope.join(', ')}."]
+      out << format('%.2fh recorded, %.2fh to invoice, %.2fh billable.', act, adj, bill)
+      out << window_note(window_state)
+      out << ''
+      out << "#{pad('Started', 17)}#{pad('User', 18)}#{pad('Ticket', 10)}#{'Rec'.rjust(7)}" \
+             "#{'Adj'.rjust(7)}  #{pad('BillableStatus', 16)}#{pad('Work type', 18)}Billing role"
+      out << ('-' * 116)
+      rows.first(limit).each do |e|
+        at = entry_started_at(e)
+        out << "#{pad(at ? at.strftime('%Y-%m-%d %H:%M') : '⚠ no date', 17)}" \
+               "#{pad(nested(e, 'User', 'Name') || api.user_name(nested(e, 'User', 'Id')), 18)}" \
+               "#{pad("G-#{nested(e, 'Ticket', 'Number')}", 10)}" \
+               "#{format('%6.2fh', e['ActualHours'].to_f)}#{format('%6.2fh', e['AdjustedHours'].to_f)}  " \
+               "#{pad(nested(e, 'BillableStatus', 'Name') || '(none)', 16)}" \
+               "#{pad(nested(e, 'WorkType', 'Name'), 18)}#{clip(nested(e, 'BillingRole', 'Name'), 24)}"
+
+        detail = []
+        detail << clip(nested(e, 'Ticket', 'Title'), 60)
+        line = nested(e, 'ServiceLine', 'Name')
+        detail << "service line (UI: contract) #{line}" unless line.to_s.strip.empty?
+        comment = e['Comment'].to_s.strip
+        detail << comment unless comment.empty?
+        out << "#{' ' * 4}↳ #{clip(detail.join(' · '), 108)}"
+      end
+      out << "#{rows.size - limit} more not shown - raise limit." if rows.size > limit
+      out.join("\n")
+    end
+  end
+
+  # ---- 16. api probe -------------------------------------------------------
 
   def api_probe(server, api)
     server.tool(

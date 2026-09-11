@@ -11,6 +11,14 @@
 #   - /v1/contacts filters on ClientId (singular); /v1/tickets on ClientIds
 #   - /v1/assets/agents gained ClientIds filtering on 2026-08-21; before
 #     that it had no filters at all and the whole fleet had to be paged
+#   - the 2026-09-04 release added /v1/time-entries, /v1/contracts,
+#     /v1/billing-roles and /v1/work-types. The first two paginate the same
+#     way; the last two are small unpaginated reference tables.
+#   - CONTRACT TERMINOLOGY IS INVERTED between the API and the web UI. An API
+#     `contract` is what the UI calls a "Contract Group" (the invoice), and an
+#     API `ServiceLine` is what the UI calls a "Contract". Gorelo has said it
+#     will align the UI to the API eventually. Until then, never print one
+#     word without the other.
 
 require 'net/http'
 require 'uri'
@@ -70,9 +78,14 @@ module Gorelo
       @logger         = logger || ->(m) { warn "[gorelo] #{m}" }
       @write_log_path = write_log_path || File.join(Dir.home, '.gorelo-mcp-writes.jsonl')
       @cache          = {}
+      @requests       = 0
     end
 
     def writes_allowed? = @allow_writes
+
+    # Every HTTP call this client makes, retries included. Tools quote it so a
+    # stated cost is measured rather than estimated.
+    def requests = @requests
 
     def guard_writes!
       return if @allow_writes
@@ -201,6 +214,20 @@ module Gorelo
       @cache[:client_names][client_id.to_s]
     end
 
+    # A time entry names its TICKET - Ticket {Id, Number, Title} - and carries
+    # no client at all, so any per-client view of hours needs a ticket-to-client
+    # index. This builds one with a SINGLE paged sweep of /v1/tickets
+    # (TotalCount/200 requests, normally a handful) and caches it for the life
+    # of the process.
+    #
+    # The alternative is GET /v1/tickets/{id} per entry, which is exactly the
+    # N+1 that /v1/time-entries exists to remove. Do not reintroduce it.
+    def ticket_client_index
+      @cache[:ticket_client] ||= get_all('/v1/tickets').each_with_object({}) do |t, h|
+        h[t['Id'].to_s] = t['ClientId']
+      end
+    end
+
     def users
       @cache[:users] ||= get_all('/v1/organization/users')
     end
@@ -298,6 +325,7 @@ module Gorelo
     end
 
     def request(klass, path, query: {}, body: nil)
+      @requests += 1
       uri = URI.join("#{@base_url}/", path.sub(%r{\A/}, ''))
       pairs = query.reject { |_, v| v.nil? || v.to_s.empty? }
       uri.query = URI.encode_www_form(pairs) unless pairs.empty?
@@ -373,7 +401,13 @@ module Gorelo
         # guessing: GET a candidate path, and a 405 proves the endpoint is real
         # even though this server will only ever read from it. It is how
         # /v1/tickets/{id}/time-entries/{id} was confirmed to exist as a
-        # DELETE-only route with no readable counterpart.
+        # DELETE-only route.
+        #
+        # CORRECTION (2026-09-11): that route being DELETE-only was once read
+        # here as "time entries cannot be read at all". It never meant that,
+        # and since the 2026-09-04 release the tenant-wide collection
+        # GET /v1/time-entries returns every entry. A 405 tells you about ONE
+        # path and one verb, never about a feature.
         if code == 405
           raise Error, "#{message}\n  405 means this PATH EXISTS but does not accept GET - " \
                        "it is defined for another verb (POST, PATCH or DELETE).\n  This server " \

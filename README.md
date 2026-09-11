@@ -7,7 +7,26 @@ It runs on your own machine and speaks [MCP](https://modelcontextprotocol.io) ov
 stdin/stdout. Nothing is hosted, nothing is exposed to the internet, and your API key never
 leaves your computer.
 
-**Twelve tools, ten of them read-only.** Plain Ruby — **no gems, no Bundler, no build step.**
+**Sixteen tools, fourteen of them read-only.** Plain Ruby — **no gems, no Bundler, no build step.**
+
+> ### ⚠️ Correction — 11 September 2026
+>
+> Earlier versions of this README stated, as established fact, that **Gorelo has no
+> readable time-entry API** and that per-user hours were impossible. That was true when it
+> was written. **It is false now.** Gorelo's **4 September 2026** release shipped
+> `GET /v1/time-entries` — one row per logged entry, tenant-wide, each carrying the user
+> who logged it — along with `/v1/contracts`, `/v1/billing-roles` and `/v1/work-types`.
+>
+> `gorelo_time_report` has been rebuilt on it. It no longer attributes a ticket's hours to
+> the lead assignee, no longer warns that per-person totals are "indicative", and no longer
+> costs one request per ticket. **If you built anything on the old limitation, or repeated
+> it to anyone, it needs revisiting.** Details:
+> [what changed on 4 September 2026](#the-4-september-2026-release).
+>
+> One more thing that release makes unavoidable: in the API a **`contract` is what
+> Gorelo's web UI calls a "Contract Group"**, and a **`ServiceLine` is what the UI calls a
+> "Contract"**. The words are inverted. See
+> [contracts are inverted](#contracts-the-api-and-the-ui-use-the-same-words-for-different-things).
 
 ---
 
@@ -120,7 +139,7 @@ Restart your MCP client. Then ask it something like *"list my open Gorelo ticket
 | `GORELO_API_KEY` | **Required.** Make it read-only to start with — only one tool writes. |
 | `GORELO_MY_EMAIL` | **Required** for `assignee: "me"`. Must match your Gorelo user exactly. |
 | `GORELO_BASE_URL` | Defaults to `https://api.aue.gorelo.io`. Change for other regions. |
-| `GORELO_ALLOW_WRITES` | `true` enables the single write tool. Off by default. |
+| `GORELO_ALLOW_WRITES` | `true` enables the two write tools. Off by default. |
 
 ---
 
@@ -135,8 +154,12 @@ Restart your MCP client. Then ask it something like *"list my open Gorelo ticket
 | `gorelo_get_contact` | | Find a person by name or email across all clients |
 | `gorelo_list_assets` | | Managed devices, filterable by client or last-seen age |
 | `gorelo_billing_review` | | The Billing queue split by recorded hours — invoice, re-file, or set up a recurring charge |
-| `gorelo_time_report` | | Recorded vs invoiceable vs billable hours, and realisation, by technician or client |
+| `gorelo_time_report` | | Recorded vs invoiceable vs billable hours, and realisation, by technician or client — from real per-entry data, so per-person totals are exact |
+| `gorelo_list_time_entries` | | The individual entries behind a total: who, when, comment, work type, billing role, service line |
 | `gorelo_response_report` | | First-response times — median, 90th, worst, share within target. Costs no extra requests |
+| `gorelo_list_contracts` | | Contract **groups** (what the UI calls contracts' parent invoice) with their service lines, recurring amount, cost and margin |
+| `gorelo_billing_roles` | | The sell-rate table — what an hour is worth under each role |
+| `gorelo_work_types` | | Multipliers and per-entry minimum times — the two fields that change an invoice without changing the hours |
 | `gorelo_add_ticket_comment` | **yes** | One of two writes. Off by default. |
 | `gorelo_update_ticket` | **yes** | Sets a ticket's client or status — nothing else. Off by default. |
 | `gorelo_api_probe` | | Raw `GET` on any `/v1/…` path, for exploring |
@@ -239,7 +262,82 @@ Confirmed working:
 /v1/assets/agents                 ClientIds filter since 2026-08-21
 /v1/assets/custom                 since 2026-08-21
 /v1/organization/users
+/v1/time-entries                  GET   ← since 2026-09-04. Tenant-wide, cursor-paginated
+/v1/contracts                     GET   ← since 2026-09-04. "Contract GROUPS" in the UI
+/v1/billing-roles                 GET   ← since 2026-09-04. Small, unpaginated
+/v1/work-types                    GET   ← since 2026-09-04. Small, unpaginated
 ```
+
+`GET /v1/time-entries/statuses` is a **404**. It looks like it ought to exist, by analogy
+with `/v1/tickets/statuses`. It does not. Don't invent it.
+
+### The 4 September 2026 release
+
+**This release invalidated a claim this README made for three weeks.** Four endpoints
+appeared, all returning HTTP 200 with the usual
+`{StatusCode, IsSuccess, Data, DataContext, Notifications}` envelope and the same
+`DataContext.Pagination.NextCursor` scheme everything else uses:
+
+| Endpoint | Paginated | What it holds |
+|---|---|---|
+| `GET /v1/time-entries` | yes, cursor | One row per logged entry, **tenant-wide** |
+| `GET /v1/contracts` | yes, cursor | Recurring agreements — *the UI calls these Contract Groups* |
+| `GET /v1/billing-roles` | no | `Id`, `Name`, `HourlyRate`, `CoaCode`, `Tax` |
+| `GET /v1/work-types` | no | `Id`, `Name`, `HourlyMultiplier`, `IsDefaultOutsideBusinessHours`, `BillableStatus`, `CoaCode`, `Tax`, `MinimumTimeInMinutes` |
+
+A time entry carries:
+
+```
+Id, Ticket {Id, Number, Title}, Task, User {Id, Name},
+StartedOn, EndedOn, ActualHours, AdjustedHours,
+BillableStatus {Id, Name}, BillingRole {Id, Name}, WorkType {Id, Name},
+ServiceLine {Id, Name}, Comment, Distance, Attachments,
+CreatedOn, UpdatedOn
+```
+
+**What this changed here.** `gorelo_time_report` used to page `/v1/tickets`, fetch each
+ticket's time summary with **one extra request per ticket**, and book every hour to that
+ticket's **lead assignee** — so an assisting technician's time was reported against
+somebody else. It said so on every run, and the caveat was honest. It is now one paged
+sweep of `/v1/time-entries`, grouped by the `User` on each entry, so **per-technician
+totals are exact** and assisting time lands on whoever did it. The warning has been
+deleted along with the behaviour that made it necessary.
+
+**Two things to settle before you rely on it.**
+
+*An entry has no client.* It names its `Ticket` and nothing else, so anything grouped or
+filtered by client needs a ticket-to-client lookup. This server builds one with a **single
+paged sweep of `/v1/tickets`**, cached for the life of the process, and says so in the
+reply — never a fetch per entry, which is the N+1 the new endpoint exists to remove.
+Grouping by technician costs nothing beyond the entries themselves.
+
+*The window filter's parameter name is unverified.* `/v1/tickets` documents
+`CreatedSince`/`UpdatedSince`; whether `/v1/time-entries` accepts either has not been
+confirmed against the spec, and this API **ignores parameters it doesn't recognise**, so a
+wrong name returns everything and looks like it worked. So the guess is only allowed to
+make the call cheaper, never to decide what's in the report: the window is applied
+**locally** on `StartedOn`, the value sent is padded two weeks earlier, and the call is
+retried without it if it's rejected. Every reply says which of those happened, so the
+first person to run it against a live tenant learns the answer instead of inheriting the
+guess.
+
+### Contracts: the API and the UI use the same words for different things
+
+**They are inverted, and it will make correct data look wrong.**
+
+| In the API | In Gorelo's web UI |
+|---|---|
+| a `contract` (`/v1/contracts`) | a **Contract Group** — the invoice |
+| a `ServiceLine` inside it | a **Contract** |
+
+So one API contract is a billing container holding several UI contracts. Gorelo has said
+it intends to **align the UI to the API** eventually, which means the words will swap
+rather than the confusion disappearing. `gorelo_list_contracts` prints both vocabularies on
+every run for exactly that reason, and `gorelo_list_time_entries` labels an entry's
+`ServiceLine` as *"service line (UI: contract)"*.
+
+A contract group with **no service lines** is flagged: it is an invoice container with
+nothing on it, and from outside it looks identical to a healthy one.
 
 ### The 2026-08-21 release
 
@@ -319,9 +417,14 @@ content**, and never rely on deleting a comment to remove sensitive data.
 **405 versus 404 maps the surface.** A `404` means no route of any verb matches that path. A
 `405` means **the route exists and does not accept this one**. So a plain `GET` against a
 candidate path is a reliable existence test, even for write-only endpoints this server would
-never call — which is how the DELETE-only time-entry route above was confirmed after two
-wrongly-spelled guesses had returned 404. `gorelo_api_probe` explains any 405 it gets rather
-than reporting it as a dead end.
+never call — which is how `/v1/tickets/{id}/time-entries/{id}` was confirmed to be a
+DELETE-only route after two wrongly-spelled guesses had returned 404. `gorelo_api_probe`
+explains any 405 it gets rather than reporting it as a dead end.
+
+⚠️ **But a 405 tells you about one path and one verb — never about a feature.** That
+DELETE-only route was read here as proof that *time entries could not be read at all*, which
+it never was; the tenant-wide collection simply hadn't shipped yet. Map paths this way, not
+capabilities.
 
 `DataContext.Pagination.TotalCount` comes back on every query, so **counting anything costs
 one request** with `PageSize=1`.
@@ -354,10 +457,19 @@ python3 test/mock_gorelo.py       # in one terminal
 python3 test/drive.py             # in another
 ```
 
-69 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
+97 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
 assisting assignees, watcher-only exclusion, closed-ticket exclusion, lookup by number,
 deleted comments, cursor pagination, rate-limit retry, every write guard, and the protocol
 edge cases (unknown method, unknown tool, malformed input).
+
+The fake tenant carries 224 time entries — enough to force a second cursor page — including
+**two technicians logging time on one ticket**, which is precisely the case the old
+lead-assignee attribution got wrong. One client is held back from the bulk generator so a
+per-client total is exactly predictable, which is what proves the ticket-to-client
+resolution works at all: an entry carries no client of its own. The fake `/v1/time-entries`
+**ignores every query parameter it is given**, as the real API does with names it doesn't
+recognise, so a tool that trusted a server-side window filter would report the wrong window
+and the suite would catch it. `/v1/time-entries/statuses` answers 404, because it does.
 
 `python3 test/drive.py somefile.json` runs an arbitrary list of tool calls instead, which is
 the quick way to eyeball output while changing a tool.
@@ -389,7 +501,8 @@ resources — leaves the tools unchanged.
 which would corrupt the line framing, and JSON is generated `ascii_only` so the bytes on the
 wire are pure ASCII whatever the machine's code page.
 
-**Not readable through the API:** invoices, contracts, and **time entries**.
+**Still not observed through the API:** invoices. Contracts and time entries **are** readable
+as of 4 September 2026 — see above.
 
 Confirmed endpoints (this list is what has been *observed*, not a claim to completeness — see
 the warning below):
@@ -400,26 +513,34 @@ the warning below):
 /v1/assets/custom      {id}           /v1/tickets
 /v1/clients            {id}           /v1/tickets/{ticketId}   GET PATCH DELETE
 /v1/clients/{id}/locations            /v1/contacts             {id}
+/v1/time-entries       (2026-09-04)   /v1/contracts            (2026-09-04)
+/v1/billing-roles      (2026-09-04)   /v1/work-types           (2026-09-04)
 /v1/tickets/{id}/time-entries/{id}    DELETE only — see below
 ```
 
-### Time entries exist, and cannot be read
+### Time entries: what was true until 4 September 2026, and what is true now
 
-`/v1/tickets/{ticketId}/time-entries/{id}` **is a real route** — a `GET` returns **405 Method
-Not Allowed**, not 404. But:
+**This section used to say time entries could not be read. That is no longer correct, and the
+reasoning that led there is worth keeping as a warning.**
 
-- the **collection** path `/v1/tickets/{id}/time-entries` returns 404 — no route at all;
-- `/v1/time-entries/{id}` returns 404 — it is ticket-scoped only;
-- the ticket detail carries `Time` **totals**, never individual entry ids.
+The evidence at the time was real: `/v1/tickets/{ticketId}/time-entries/{id}` answers **405**
+to a `GET`, so the route exists for another verb; the **collection** path
+`/v1/tickets/{id}/time-entries` answered **404**; `/v1/time-entries/{id}` answered **404**;
+and the ticket detail carried `Time` **totals** with no entry ids. The conclusion drawn — that
+Gorelo shipped a way to *delete* a time entry and no way to *read* one — followed from those
+four observations and was stated here as fact.
 
-So Gorelo ships a way to **delete** a time entry and no way to **read** one. Nothing in the API
-will tell you an entry's id, which makes the DELETE unusable from the API alone. Worth raising
-with them; until it changes, hours exist only as a per-ticket total.
+**What was actually being measured was four paths on one day.** On **4 September 2026** Gorelo
+shipped the tenant-wide collection `GET /v1/time-entries`, which returns every entry with its
+`User`, hours, `BillableStatus`, work type, billing role and comment. The per-ticket sub-route
+is still DELETE-only, and this server still never sends DELETE — but "one path is write-only"
+was never the same claim as "this data cannot be read", and conflating them cost this README
+three weeks of telling other people something untrue.
 
-That is why `gorelo_time_report` attributes a ticket's hours to its lead assignee — counting an
-assisting technician's time against the lead — says so on every run, and leans on
-**realisation** (billable ÷ invoiceable), a ratio that survives the attribution problem far
-better than a per-person total does.
+`gorelo_time_report` no longer attributes hours to a lead assignee, because it no longer has
+to guess who did the work: the entry says. **Realisation** is now reported as its own ratio
+(`AdjustedHours ÷ ActualHours` — what survived rounding and write-downs) with the **billable
+share** as a separate column, rather than the two being folded into one number.
 
 ⚠️ **Do not treat any endpoint list as complete, including this one.** The published
 `swagger.json` is large enough that fetching it through a summarising tool silently truncates,
