@@ -255,14 +255,16 @@ Confirmed working:
 /v1/tickets/{id}/comments         GET, POST   (oldest-first; ConversationType filter)
 /v1/tickets/{id}/comments/{id}    GET
 /v1/tickets/{id}/conversations    GET
-/v1/tickets/{id}/attachments      POST
+/v1/attachments                   POST  ← since 2026-09-25, multipart. /v1/tickets/{id}/attachments
+                                        is no longer in the spec
 /v1/tickets/statuses | /tags | /types
 /v1/clients
 /v1/contacts                      ClientId is SINGULAR here
 /v1/assets/agents                 ClientIds filter since 2026-08-21
 /v1/assets/custom                 since 2026-08-21
 /v1/organization/users
-/v1/time-entries                  GET   ← since 2026-09-04. Tenant-wide, cursor-paginated
+/v1/time-entries                  GET   ← since 2026-09-04. Tenant-wide, cursor-paginated.
+                                        Filters documented 2026-09-25 - see below
 /v1/contracts                     GET   ← since 2026-09-04. "Contract GROUPS" in the UI
 /v1/billing-roles                 GET   ← since 2026-09-04. Small, unpaginated
 /v1/work-types                    GET   ← since 2026-09-04. Small, unpaginated
@@ -303,23 +305,36 @@ sweep of `/v1/time-entries`, grouped by the `User` on each entry, so **per-techn
 totals are exact** and assisting time lands on whoever did it. The warning has been
 deleted along with the behaviour that made it necessary.
 
-**Two things to settle before you rely on it.**
+*An entry has no client.* It names its `Ticket` and nothing else. **Filtering** by client
+is now done by the API with `ClientIds` (see the 25 September release below), but
+**grouping** entries by client across several clients still needs a ticket-to-client
+lookup. This server builds one with a **single paged sweep of `/v1/tickets`**, cached for
+the life of the process, and says so in the reply — never a fetch per entry, which is the
+N+1 the new endpoint exists to remove.
 
-*An entry has no client.* It names its `Ticket` and nothing else, so anything grouped or
-filtered by client needs a ticket-to-client lookup. This server builds one with a **single
-paged sweep of `/v1/tickets`**, cached for the life of the process, and says so in the
-reply — never a fetch per entry, which is the N+1 the new endpoint exists to remove.
-Grouping by technician costs nothing beyond the entries themselves.
+### The 25 September 2026 release
 
-*The window filter's parameter name is unverified.* `/v1/tickets` documents
-`CreatedSince`/`UpdatedSince`; whether `/v1/time-entries` accepts either has not been
-confirmed against the spec, and this API **ignores parameters it doesn't recognise**, so a
-wrong name returns everything and looks like it worked. So the guess is only allowed to
-make the call cheaper, never to decide what's in the report: the window is applied
-**locally** on `StartedOn`, the value sent is padded two weeks earlier, and the call is
-retried without it if it's rejected. Every reply says which of those happened, so the
-first person to run it against a live tenant learns the answer instead of inheriting the
-guess.
+**It settled the one thing the 4 September section left open, and exposed a bug.**
+
+*The window filter is documented now.* This README used to say the window parameter on
+`/v1/time-entries` was unverified, and the server guessed `CreatedSince`, padded it, and
+hedged every reply. The spec now documents `StartedSince`, `StartedBefore`,
+`CreatedSince`/`Before`, `UpdatedSince`/`Before`, and the id filters `ClientIds`,
+`LocationIds`, `TicketIds`, `TaskIds`, `UserIds` and `InvoiceIds`. The server now sends
+`StartedSince`, `UserIds`, `ClientIds` and `TicketIds`. Checked against a live tenant: a
+7-day report is **one request** and nothing from before the window comes back. The window
+is still re-checked locally, but only as a safety net, and a reply warns if it ever catches
+anything.
+
+*`AdjustedHours` can be null, and null does not mean zero.* The spec now says
+`AdjustedHours` is **null when no rounding applied, and the billed duration is then
+`ActualHours`**. This server read the null as `0`, so every unrounded entry vanished from
+"to invoice" and "billable", and realisation came out low. It is fixed. On the tenant it
+was checked against, every work type rounds, so no entry in the previous 30 days was
+affected — but a tenant, or a work type, without rounding would have been.
+
+The same release added invoices, the item catalogue, taxes, full contract detail, uptime
+checks and a general attachment upload. They aren't used by this server yet.
 
 ### Contracts: the API and the UI use the same words for different things
 
@@ -384,7 +399,8 @@ in the way.
 **Gorelo publishes a full OpenAPI spec** — read it before guessing at parameter names:
 
 - Swagger UI: `https://api.aue.gorelo.io/swagger` (AU) · `https://api.usw.gorelo.io/swagger` (US)
-- Spec JSON: append `/v1/swagger.json`
+- Spec JSON: `https://api.aue.gorelo.io/swagger/v1/swagger.json` (no API key needed).
+  Appending `/v1/swagger.json` to the base URL, as this README used to say, is a 404.
 - Docs index built for LLMs: [help.gorelo.io/llms.txt](https://help.gorelo.io/llms.txt)
 
 `GET /v1/tickets` documents: `Query`, `StatusIds`, `ClientIds`, `PriorityIds`, `TypeIds`,
@@ -457,19 +473,21 @@ python3 test/mock_gorelo.py       # in one terminal
 python3 test/drive.py             # in another
 ```
 
-97 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
+104 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
 assisting assignees, watcher-only exclusion, closed-ticket exclusion, lookup by number,
 deleted comments, cursor pagination, rate-limit retry, every write guard, and the protocol
 edge cases (unknown method, unknown tool, malformed input).
 
-The fake tenant carries 224 time entries — enough to force a second cursor page — including
+The fake tenant carries 225 time entries — enough to force a second cursor page — including
 **two technicians logging time on one ticket**, which is precisely the case the old
 lead-assignee attribution got wrong. One client is held back from the bulk generator so a
 per-client total is exactly predictable, which is what proves the ticket-to-client
-resolution works at all: an entry carries no client of its own. The fake `/v1/time-entries`
-**ignores every query parameter it is given**, as the real API does with names it doesn't
-recognise, so a tool that trusted a server-side window filter would report the wrong window
-and the suite would catch it. `/v1/time-entries/statuses` answers 404, because it does.
+resolution works at all: an entry carries no client of its own. One of that client's
+entries has a **null `AdjustedHours`**, which must invoice at its `ActualHours`. The fake
+`/v1/time-entries` honours the filters the spec documents and **ignores every other name**,
+as the real API does, and it records the query it last received, so the suite asserts
+which parameter names were actually sent. `/v1/time-entries/statuses` answers 404,
+because it does.
 
 `python3 test/drive.py somefile.json` runs an arbitrary list of tool calls instead, which is
 the quick way to eyeball output while changing a tool.
@@ -539,7 +557,8 @@ three weeks of telling other people something untrue.
 
 `gorelo_time_report` no longer attributes hours to a lead assignee, because it no longer has
 to guess who did the work: the entry says. **Realisation** is now reported as its own ratio
-(`AdjustedHours ÷ ActualHours` — what survived rounding and write-downs) with the **billable
+(invoiceable ÷ recorded hours — what survived rounding and write-downs, where a null
+`AdjustedHours` invoices at `ActualHours`) with the **billable
 share** as a separate column, rather than the two being folded into one number.
 
 ⚠️ **Do not treat any endpoint list as complete, including this one.** The published

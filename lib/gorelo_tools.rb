@@ -903,64 +903,39 @@ module GoreloTools
     nil
   end
 
-  # UNVERIFIED PARAMETER NAME. /v1/tickets documents CreatedSince / UpdatedSince;
-  # whether /v1/time-entries accepts either, accepts something else, or accepts
-  # no window filter at all has NOT been confirmed against the spec, and this
-  # server does not guess against a live tenant to find out. The API also
-  # IGNORES query parameters it does not recognise rather than rejecting them,
-  # so a wrong name returns the full unfiltered set and looks exactly like a
-  # working filter.
-  #
-  # The guess is therefore only ever allowed to make the call CHEAPER, never to
-  # decide what ends up in the report:
-  #
-  #   * the window is applied LOCALLY on StartedOn, always;
-  #   * the value sent is padded two weeks earlier than the window, so an entry
-  #     created before the window for work done inside it cannot be lost if the
-  #     filter IS honoured;
-  #   * if the endpoint rejects the parameter outright, the call is retried
-  #     without it.
-  #
-  # The reply says which of those three happened, so the first person to run
-  # this against a tenant learns the answer instead of inheriting the guess.
-  TIME_WINDOW_PARAM    = 'CreatedSince'
-  TIME_WINDOW_PAD_DAYS = 14
-
-  def fetch_time_entries(api, since)
-    padded = since - (TIME_WINDOW_PAD_DAYS * 86_400)
-
-    rows = begin
-      api.get_all('/v1/time-entries', { TIME_WINDOW_PARAM => padded.strftime('%Y-%m-%d') })
-    rescue Gorelo::AuthError
-      raise
-    rescue Gorelo::Error
-      return [api.get_all('/v1/time-entries'), :rejected]
-    end
-
-    outside = rows.any? do |e|
-      raw = e['CreatedOn']
-      next false if raw.nil? || raw.to_s.empty?
-
-      (Time.parse(raw.to_s).utc < padded rescue false)
-    end
-    [rows, outside ? :ignored : :applied]
+  # The hours an entry will be invoiced at. AdjustedHours is what survives the
+  # work type's minimum and increment rounding, and Gorelo sends it as NULL
+  # when no rounding applied - the billed duration is then simply ActualHours
+  # (spec, 25 September 2026 release). Reading that null as zero silently
+  # removed every unrounded entry from "to invoice" and "billable". Always go
+  # through here; never read AdjustedHours directly.
+  def billed_hours(entry)
+    adj = entry['AdjustedHours']
+    adj.nil? ? entry['ActualHours'].to_f : adj.to_f
   end
 
-  def window_note(state)
-    case state
-    when :rejected
-      "#{TIME_WINDOW_PARAM} was REJECTED by /v1/time-entries, so the whole entry history " \
-        'was paged and the window applied locally.'
-    when :ignored
-      "#{TIME_WINDOW_PARAM} was IGNORED by /v1/time-entries (rows older than it came back), " \
-        'so the whole entry history was paged and the window applied locally. The parameter ' \
-        'name is unverified - see the comment above fetch_time_entries.'
-    else
-      "#{TIME_WINDOW_PARAM} (padded #{TIME_WINDOW_PAD_DAYS}d) was sent and nothing older came " \
-        'back - which is consistent with the filter being applied AND with there simply being ' \
-        'no older entries, so it is not proof either way. The parameter name is unverified; ' \
-        'the window is enforced locally on StartedOn regardless.'
-    end
+  # Pages /v1/time-entries with the window sent as StartedSince - documented in
+  # the spec since the 25 September 2026 release. Before that the name was
+  # unknown, this server guessed CreatedSince (the wrong date, and in fact
+  # ignored), and hedged every reply about it. `filters` carries the other
+  # documented names: ClientIds, UserIds, TicketIds.
+  #
+  # The API still IGNORES names it does not recognise, so the window is
+  # re-checked locally on StartedOn. Rows from before it would mean the filter
+  # stopped being honoured; they are dropped and counted, never kept quietly.
+  # Returns [rows_in_window, rows_that_came_back_outside_it].
+  def fetch_time_entries(api, since, filters = {})
+    query = filters.merge('StartedSince' => since.utc.iso8601)
+    rows  = api.get_all('/v1/time-entries', query)
+    stray = rows.count { |e| (at = entry_started_at(e)) && at < since }
+    [rows.reject { |e| (at = entry_started_at(e)) && at < since }, stray]
+  end
+
+  def stray_note(stray)
+    return nil unless stray.positive?
+
+    "⚠ #{stray} entr(ies) from BEFORE the window came back despite StartedSince, and were " \
+      'dropped locally. The API may have stopped honouring the filter - check the spec.'
   end
 
   def time_report(server, api)
@@ -977,24 +952,25 @@ module GoreloTools
         per-TICKET totals and booked them all to the lead assignee, and warned that per-person
         figures were only indicative. That warning is gone because the limitation is.)
 
-        REALISATION is AdjustedHours / ActualHours - what survived Gorelo's 6-minute rounding
-        and any write-down. BILL% is the invoiceable share whose own BillableStatus says
+        REALISATION is invoiceable / recorded hours - what survived Gorelo's rounding and any
+        write-down. An entry's AdjustedHours is NULL when no rounding applied, and it then
+        invoices at its ActualHours; it is never read as zero. BILL% is the invoiceable share whose own BillableStatus says
         billable. The entry decides that; it is never re-derived from the work type or the
         contract. Every BillableStatus seen is listed with its hours, so nothing is classified
         out of sight.
 
-        COST: one paged sweep of /v1/time-entries. An entry names its TICKET but NOT its
-        CLIENT, so grouping or filtering by client costs one extra paged sweep of /v1/tickets
-        to build a ticket-to-client index - never a fetch per entry. Grouping by technician
-        with no client filter costs nothing beyond the entries themselves. The reply states the
-        measured request count.
+        COST: one paged sweep of /v1/time-entries, with the window, technician and client all
+        filtered by the API (StartedSince, UserIds, ClientIds). An entry names its TICKET but
+        NOT its CLIENT, so GROUPING by client across more than one client costs one extra
+        paged sweep of /v1/tickets to build a ticket-to-client index - never a fetch per
+        entry. The reply states the measured request count.
       TEXT
       input_schema: {
         type: 'object',
         properties: {
-          days:     { type: 'integer', description: "Window in days, matched locally on each entry's StartedOn. Default 30." },
+          days:     { type: 'integer', description: "Window in days, on each entry's StartedOn. Default 30." },
           assignee: { type: 'string', description: 'Whose entries: Gorelo user id, email, name fragment, or "me". Use "anyone" to cover the organisation. Default "me".' },
-          client:   { type: 'string', description: 'Restrict to one or more clients (name fragment, comma-separated). Costs one extra paged sweep of /v1/tickets, because entries carry no client.' },
+          client:   { type: 'string', description: 'Restrict to one or more clients (name fragment, comma-separated). Sent to the API as ClientIds.' },
           group_by: { type: 'string', enum: %w[technician client], description: 'Default "client" for one technician, "technician" for "anyone".' },
           limit:    { type: 'integer', description: 'Max time entries to include. Default 5000. Entries no longer cost a request each, so this is a safety valve rather than a tuning knob - and any cap it applies is stated loudly.' }
         },
@@ -1006,48 +982,46 @@ module GoreloTools
       since   = Time.now.utc - (days * 86_400)
       started = api.requests
 
-      all_rows, window_state = fetch_time_entries(api, since)
-      scope = ["last #{days}d"]
+      scope   = ["last #{days}d"]
+      filters = {}
 
-      # An entry with an unreadable date is KEPT and counted separately. Dropping
-      # it would quietly shrink somebody's week.
-      undated = 0
-      rows = all_rows.select do |e|
-        at = entry_started_at(e)
-        if at.nil?
-          undated += 1
-          true
-        else
-          at >= since
-        end
-      end
-      in_window = rows.size
-
-      assignee = args['assignee'] || 'me'
-      org_wide = assignee.to_s.downcase == 'anyone'
+      # An empty assignee must not become an empty UserIds, which the API would
+      # drop - silently widening "my time" to everybody's.
+      assignee = args['assignee'].to_s.strip
+      assignee = 'me' if assignee.empty?
+      org_wide = assignee.downcase == 'anyone'
       unless org_wide
-        uid  = api.resolve_user_id(assignee)
-        rows = rows.select { |e| nested(e, 'User', 'Id').to_s == uid.to_s }
+        filters['UserIds'] = api.resolve_user_id(assignee)
         scope << "assignee=#{assignee}"
       end
 
       group_by = args['group_by'] || (org_wide ? 'technician' : 'client')
 
-      # How the client gets resolved, stated plainly because it is the one place
-      # this report spends requests it does not strictly have to.
+      # An entry names its Ticket but NOT its client. A client FILTER is sent as
+      # ClientIds and costs nothing extra; only GROUPING by client needs the
+      # ticket-to-client index, and not even that when exactly one client was
+      # asked for. Stated plainly, because it is the one place this report can
+      # spend requests it does not strictly have to.
       index      = nil
+      sole       = nil
       index_note = 'No client lookup was needed, so the entries were the only requests.'
       if args['client'] && !args['client'].to_s.empty?
         matched = api.resolve_clients(args['client'])
         next "No client matches #{args['client'].inspect}." if matched.empty?
 
-        tickets = api.get_all('/v1/tickets',
-                              { 'ClientIds' => matched.map { |c| c['Id'] }.join(',') })
-        index = tickets.each_with_object({}) { |t, h| h[t['Id'].to_s] = t['ClientId'] }
-        rows  = rows.select { |e| index.key?(nested(e, 'Ticket', 'Id').to_s) }
+        filters['ClientIds'] = matched.map { |c| c['Id'] }.join(',')
         scope << "client=#{matched.map { |c| c['Name'] }.first(3).join(' + ')}"
-        index_note = "Entries carry no client, so the named client's #{tickets.size} ticket(s) " \
-                     'were fetched once with ClientIds and the entries matched on Ticket.Id.'
+        if matched.size == 1
+          sole       = matched.first['Id']
+          index_note = 'Filtered by the API with ClientIds; one client matched, so no lookup was needed.'
+        elsif group_by == 'client'
+          index      = api.ticket_client_index
+          index_note = "Filtered by the API with ClientIds. Entries carry no client, so grouping " \
+                       "#{matched.size} clients took ONE paged sweep of /v1/tickets (cached for " \
+                       'this process), not one fetch per entry.'
+        else
+          index_note = 'Filtered by the API with ClientIds, so no lookup was needed.'
+        end
       elsif group_by == 'client'
         index = api.ticket_client_index
         index_note = "Entries carry no client, so all #{index.size} ticket(s) were indexed by " \
@@ -1055,10 +1029,15 @@ module GoreloTools
                      'per entry.'
       end
 
+      rows, stray = fetch_time_entries(api, since, filters)
+
+      # StartedSince decides the window server-side, so an entry with no
+      # readable date is one the API put inside it. It is KEPT and counted:
+      # dropping it would quietly shrink somebody's week.
+      undated = rows.count { |e| entry_started_at(e).nil? }
+
       if rows.empty?
-        next "No time entries #{scope.join(', ')}. " \
-             "#{all_rows.size} entry row(s) came back from /v1/time-entries; " \
-             "#{in_window} fell inside the window.\n#{window_note(window_state)}"
+        next ["No time entries #{scope.join(', ')}.", stray_note(stray)].compact.join("\n")
       end
 
       included = rows.first(limit)
@@ -1072,7 +1051,7 @@ module GoreloTools
 
       included.each do |e|
         act = e['ActualHours'].to_f
-        adj = e['AdjustedHours'].to_f
+        adj = billed_hours(e)
         bil = billable_entry?(e) ? adj : 0.0
         tid = nested(e, 'Ticket', 'Id').to_s
 
@@ -1080,7 +1059,7 @@ module GoreloTools
                 nested(e, 'User', 'Name') || api.user_name(nested(e, 'User', 'Id')) ||
                   "user #{nested(e, 'User', 'Id')}"
               else
-                cid = index && index[tid]
+                cid = sole || (index && index[tid])
                 cid ? (api.client_name(cid) || "client #{cid}") : "⚠ CLIENT UNRESOLVED"
               end
 
@@ -1111,10 +1090,11 @@ module GoreloTools
       end
 
       out = ["Recorded time - #{scope.join(', ')}."]
-      out << "#{all_rows.size} time entry row(s) returned, #{in_window} inside the window, " \
+      out << "#{rows.size} time entry row(s) returned, " \
              "#{included.size} included, across #{per_ticket.size} ticket(s). " \
              "#{api.requests - started} request(s) in total."
-      out << window_note(window_state)
+      out << 'The window was sent to the API as StartedSince.'
+      out << stray_note(stray) if stray.positive?
       out << index_note
       out << ''
       out << 'Per-person figures are EXACT: every hour is counted against the user named on its'
@@ -1173,8 +1153,8 @@ module GoreloTools
 
       if undated.positive?
         out << ''
-        out << "⚠ #{undated} entr(ies) had no readable StartedOn or CreatedOn and were KEPT " \
-               'rather than dropped, so the window may be slightly generous.'
+        out << "⚠ #{undated} entr(ies) had no readable StartedOn or CreatedOn. The API placed " \
+               'them inside the window, and they were KEPT rather than dropped.'
       end
 
       if rows.size > included.size
@@ -1673,15 +1653,17 @@ module GoreloTools
         calls the /v1/contracts record that holds it a CONTRACT GROUP. See
         gorelo_list_contracts.
 
-        Costs one paged sweep of /v1/time-entries; filtering happens locally, so no filter
-        here is silently ignored by the API.
+        Every filter is sent to the API (StartedSince, TicketIds, UserIds, ClientIds), so a
+        narrow question pages only the entries it needs. A ticket given by number costs one
+        extra request to resolve its id.
       TEXT
       input_schema: {
         type: 'object',
         properties: {
-          ticket: { type: 'string', description: 'Ticket number such as G-13933, a bare number, or a ticket id. Matched against the entry\'s own Ticket, so it costs no extra request.' },
+          ticket: { type: 'string', description: 'Ticket number such as G-13933, a bare number, or a ticket id.' },
           user:   { type: 'string', description: 'Gorelo user id, email, name fragment, or "me". Default: everyone.' },
-          days:   { type: 'integer', description: "Window in days, matched locally on StartedOn. Default 14." },
+          client: { type: 'string', description: 'Client name fragment or id, comma-separated for several.' },
+          days:   { type: 'integer', description: "Window in days, on StartedOn. Default 14." },
           billable: { type: 'string', enum: %w[all billable other], description: 'Filter on the entry BillableStatus. Default "all".' },
           limit:  { type: 'integer', description: 'Default 60.' }
         },
@@ -1692,26 +1674,33 @@ module GoreloTools
       limit = (args['limit'] || 60).to_i.clamp(1, 500)
       since = Time.now.utc - (days * 86_400)
 
-      all_rows, window_state = fetch_time_entries(api, since)
-      scope = ["last #{days}d"]
-
-      rows = all_rows.select { |e| (at = entry_started_at(e)).nil? || at >= since }
+      scope   = ["last #{days}d"]
+      filters = {}
 
       if args['ticket'] && !args['ticket'].to_s.empty?
-        ref  = args['ticket'].to_s.strip
-        key  = ref.sub(/\AG-/i, '')
-        rows = rows.select do |e|
-          nested(e, 'Ticket', 'Number').to_s == key ||
-            nested(e, 'Ticket', 'Id').to_s.casecmp?(ref)
-        end
+        ref = args['ticket'].to_s.strip
+        t   = find_ticket(api, ref)
+        next "No ticket matches #{ref.inspect}." unless t
+
+        filters['TicketIds'] = t['Id']
         scope << "ticket=#{ref}"
       end
 
       if args['user'] && !args['user'].to_s.empty?
-        uid  = api.resolve_user_id(args['user'])
-        rows = rows.select { |e| nested(e, 'User', 'Id').to_s == uid.to_s }
+        filters['UserIds'] = api.resolve_user_id(args['user'])
         scope << "user=#{args['user']}"
       end
+
+      if args['client'] && !args['client'].to_s.empty?
+        matched = api.resolve_clients(args['client'])
+        next "No client matches #{args['client'].inspect}." if matched.empty?
+
+        filters['ClientIds'] = matched.map { |c| c['Id'] }.join(',')
+        scope << "client=#{matched.map { |c| c['Name'] }.first(3).join(' + ')}"
+      end
+
+      all_rows, stray = fetch_time_entries(api, since, filters)
+      rows = all_rows
 
       case (args['billable'] || 'all').to_s.downcase
       when 'billable'
@@ -1723,19 +1712,19 @@ module GoreloTools
       end
 
       if rows.empty?
-        next "No time entries #{scope.join(', ')}. " \
-             "#{all_rows.size} entry row(s) came back from /v1/time-entries.\n" \
-             "#{window_note(window_state)}"
+        next ["No time entries #{scope.join(', ')}. " \
+              "#{all_rows.size} entry row(s) came back from /v1/time-entries.",
+              stray_note(stray)].compact.join("\n")
       end
 
       rows = rows.sort_by { |e| entry_started_at(e) || Time.at(0).utc }.reverse
       act  = rows.sum { |e| e['ActualHours'].to_f }
-      adj  = rows.sum { |e| e['AdjustedHours'].to_f }
-      bill = rows.select { |e| billable_entry?(e) }.sum { |e| e['AdjustedHours'].to_f }
+      adj  = rows.sum { |e| billed_hours(e) }
+      bill = rows.select { |e| billable_entry?(e) }.sum { |e| billed_hours(e) }
 
       out = ["#{rows.size} time entr(ies) - #{scope.join(', ')}."]
       out << format('%.2fh recorded, %.2fh to invoice, %.2fh billable.', act, adj, bill)
-      out << window_note(window_state)
+      out << stray_note(stray) if stray.positive?
       out << ''
       out << "#{pad('Started', 17)}#{pad('User', 18)}#{pad('Ticket', 10)}#{'Rec'.rjust(7)}" \
              "#{'Adj'.rjust(7)}  #{pad('BillableStatus', 16)}#{pad('Work type', 18)}Billing role"
@@ -1745,7 +1734,7 @@ module GoreloTools
         out << "#{pad(at ? at.strftime('%Y-%m-%d %H:%M') : '⚠ no date', 17)}" \
                "#{pad(nested(e, 'User', 'Name') || api.user_name(nested(e, 'User', 'Id')), 18)}" \
                "#{pad("G-#{nested(e, 'Ticket', 'Number')}", 10)}" \
-               "#{format('%6.2fh', e['ActualHours'].to_f)}#{format('%6.2fh', e['AdjustedHours'].to_f)}  " \
+               "#{format('%6.2fh', e['ActualHours'].to_f)}#{format('%6.2fh', billed_hours(e))}  " \
                "#{pad(nested(e, 'BillableStatus', 'Name') || '(none)', 16)}" \
                "#{pad(nested(e, 'WorkType', 'Name'), 18)}#{clip(nested(e, 'BillingRole', 'Name'), 24)}"
 

@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER = os.path.join(HERE, "..", "gorelo-mcp-server.rb")
@@ -71,6 +72,12 @@ class Server:
         self.p.stdin.close()
         self.p.wait(timeout=30)
         return self.p.stderr.read()
+
+
+def te_query():
+    """The query string the mock's /v1/time-entries last received."""
+    with urllib.request.urlopen(ENV["GORELO_BASE_URL"] + "/__debug/time-entries-query") as r:
+        return json.load(r)
 
 
 PASS, FAIL = 0, 0
@@ -205,24 +212,31 @@ def run_suite():
           "request(s) in total" in tr and
           "extra request(s) for the time breakdown" not in tr, tr[:400])
 
-    # An entry carries Ticket {Id, Number, Title} and NO client at all, so a
-    # per-client figure has to resolve the ticket. The reserved fixture client
-    # has exactly two entries: 3.00h recorded, 3.20h to invoice, 2.00h billable.
+    # The reserved fixture client has three entries: 3.50h recorded, 3.70h to
+    # invoice, 2.50h billable. One has AdjustedHours NULL - no rounding applied,
+    # so it bills its ActualHours - and reading that null as zero was a bug.
     wing = s.call("gorelo_time_report", assignee="anyone", days=400, client="Wingtip")
-    check("the client resolution is named, and costs one sweep rather than N fetches",
-          "Entries carry no client" in wing and "ClientIds" in wing, wing[:700])
+    check("a client filter is sent as ClientIds, not resolved by sweeping tickets",
+          "ClientIds" in wing and "sweep of /v1/tickets" not in wing
+          and "ClientIds" in te_query(), wing[:700])
     check("per-client totals are exact",
-          "3.00h recorded" in wing and "3.20h to invoice" in wing
-          and "2.00h billable" in wing, wing[:900])
+          "3.50h recorded" in wing and "3.70h to invoice" in wing
+          and "2.50h billable" in wing, wing[:900])
+    check("a NULL AdjustedHours bills its ActualHours, not zero",
+          "3.70h to invoice" in wing and "3.20h to invoice" not in wing, wing[:900])
     narrow = s.call("gorelo_time_report", assignee="anyone", days=3, client="Wingtip")
-    check("the window is enforced locally, because the endpoint ignores the filter",
-          "2.00h recorded" in narrow and "IGNORED" in narrow, narrow[:800])
-    check("the unverified window parameter says so rather than pretending",
-          "unverified" in narrow, narrow[:800])
+    sent = te_query()
+    check("the window is sent as the documented StartedSince, not the old CreatedSince guess",
+          "StartedSince" in sent and "CreatedSince" not in sent, sent)
+    check("the window holds", "2.50h recorded" in narrow, narrow[:800])
+    check("the retired 'unverified parameter' hedging is gone",
+          "unverified" not in narrow and "IGNORED" not in narrow, narrow[:800])
 
     alex = s.call("gorelo_time_report", assignee="alex", days=400, group_by="technician")
     check("an assignee filter keeps only that technician's own entries",
           "Alex Kim" in alex and "Sam Rivers" not in alex, alex[:900])
+    check("and is sent as UserIds rather than filtered locally",
+          te_query().get("UserIds") == "3001", te_query())
 
     capped = s.call("gorelo_time_report", assignee="anyone", days=400, limit=2)
     check("an entry cap is stated loudly, not silently applied",
@@ -271,13 +285,22 @@ def run_suite():
     check("the technician's own comment survives", "Assisted with the mailbox" in te, te[:1000])
     check("service line is labelled with the UI's word for it too",
           "service line (UI: contract)" in te, te[:1000])
+    check("a ticket filter is sent as TicketIds", "TicketIds" in te_query(), te_query())
     mine = s.call("gorelo_list_time_entries", ticket="G-1000", user="alex", days=30)
     check("a per-user filter works on a ticket led by somebody else",
           "Alex Kim" in mine and "Sam Rivers" not in mine, mine[:500])
+    wt3 = s.call("gorelo_list_time_entries", client="Wingtip", days=3)
+    check("entries filter by client",
+          "2 time entr(ies)" in wt3 and "2.50h recorded, 2.50h to invoice" in wt3, wt3[:500])
+    check("an unrounded entry shows its billed hours, not 0.00h",
+          "0.50h  0.50h" in wt3 and "0.50h  0.00h" not in wt3, wt3[:900])
     nb = s.call("gorelo_list_time_entries", days=400, billable="other", limit=5)
     check("non-billable entries can be isolated",
           "non-billable only" in nb and "0.00h billable" in nb, nb[:400])
-    empty = s.call("gorelo_list_time_entries", ticket="G-999999", days=30)
+    nosuch = s.call("gorelo_list_time_entries", ticket="G-999999", days=30)
+    check("an unknown ticket is named, not reported as zero hours",
+          "No ticket matches" in nosuch, nosuch)
+    empty = s.call("gorelo_list_time_entries", client="Wingtip", user="alex", days=3)
     check("an empty result says how many rows it looked at",
           "No time entries" in empty and "came back from /v1/time-entries" in empty, empty)
 

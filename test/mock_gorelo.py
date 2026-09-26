@@ -20,8 +20,13 @@ break things:
   * unknown query parameters are ignored rather than rejected, so a wrong
     name looks like a successful call that returns everything
   * 429 rate limiting with a retry_after
-  * /v1/time-entries (added by Gorelo on 2026-09-04) is cursor-paginated and
-    IGNORES every filter it is given, so a window has to be applied locally
+  * /v1/time-entries (added by Gorelo on 2026-09-04) is cursor-paginated. It
+    honours the filters the spec documents (StartedSince, StartedBefore,
+    ClientIds, UserIds, TicketIds) and IGNORES any other name - so a guessed
+    parameter returns everything, exactly as on the real API. The last query
+    it received is readable at /__debug/time-entries-query
+  * AdjustedHours on a time entry is NULL when no rounding applied, and the
+    billed duration is then ActualHours - not zero
   * an API `contract` is what the web UI calls a "Contract Group", and its
     `ServiceLines` are what the UI calls "Contracts" - inverted, on purpose
 
@@ -41,6 +46,10 @@ ME = 2907          # the "logged in" user
 OTHER = 3001       # a colleague
 
 NOW = datetime.now(timezone.utc)
+
+# The query string /v1/time-entries last received, for asserting which
+# parameter names a tool actually sends.
+LAST_TE_QUERY = {}
 
 
 def ago(days, hours=0):
@@ -410,6 +419,13 @@ add_entry(_wingtip, ME, 2.00, 2.00, BILLABLE, WORK_TYPES[1], BILLING_ROLES[1],
 add_entry(_wingtip, OTHER, 1.00, 1.20, NOT_BILLABLE, WORK_TYPES[4],
           BILLING_ROLES[0], None, 100,
           "Internal handover notes - written off.")
+# AdjustedHours is NULL when no rounding applied, and the billed duration is
+# then ActualHours (per the spec, 2026-09-25). Reading null as zero loses this
+# half hour from "to invoice" and "billable". With it the reserved client is:
+# 3.50h recorded, 3.70h to invoice, 2.50h billable; inside 3 days, 2.50h.
+add_entry(_wingtip, ME, 0.50, None, BILLABLE, WORK_TYPES[1], BILLING_ROLES[1],
+          {"Id": 9030, "Name": "Ad hoc project work"}, 2,
+          "Patched the new switch's firmware.")
 
 # Bulk entries, enough to force cursor pagination at the default PageSize of
 # 200. Deliberately mixed BillableStatus, so realisation is never a flattering
@@ -554,6 +570,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.reply(200, env(hit))
 
     def do_GET(self):
+        if urlparse(self.path).path == "/__debug/time-entries-query":
+            return self.reply(200, LAST_TE_QUERY)
         if not self.authorised():
             return
         u = urlparse(self.path)
@@ -601,12 +619,40 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(404, fail(404, "No route /v1/time-entries/statuses"))
 
         if path == "/v1/time-entries":
-            # Cursor-paginated, and it IGNORES every query parameter it is
-            # given - exactly as the real API ignores names it does not
-            # recognise. A tool that trusts a server-side window filter here
-            # reports the wrong window and never finds out; one that filters
-            # locally is unaffected. That is the whole point of this route.
-            rows, pag = paginate(TIME_ENTRIES, q)
+            # Honours the documented filters and IGNORES every other name,
+            # exactly as the real API does. CreatedSince - the name this server
+            # used to guess - is therefore ignored and returns everything.
+            LAST_TE_QUERY.clear()
+            LAST_TE_QUERY.update({k: v[0] for k, v in q.items()})
+            rows = TIME_ENTRIES
+
+            def when(name):
+                raw = q.get(name, [None])[0]
+                return datetime.fromisoformat(raw.replace("Z", "+00:00")) if raw else None
+
+            def ids(name):
+                raw = q.get(name, [None])[0]
+                return {x for x in raw.split(",") if x} if raw else None
+
+            since, before = when("StartedSince"), when("StartedBefore")
+            if since:
+                rows = [e for e in rows if datetime.fromisoformat(
+                    e["StartedOn"].replace("Z", "+00:00")) >= since]
+            if before:
+                rows = [e for e in rows if datetime.fromisoformat(
+                    e["StartedOn"].replace("Z", "+00:00")) < before]
+            clients = ids("ClientIds")
+            if clients is not None:
+                owner = {t["Id"]: str(t["ClientId"]) for t in TICKETS}
+                rows = [e for e in rows
+                        if e["Ticket"] and owner.get(e["Ticket"]["Id"]) in clients]
+            users = ids("UserIds")
+            if users is not None:
+                rows = [e for e in rows if str(e["User"]["Id"]) in users]
+            tickets = ids("TicketIds")
+            if tickets is not None:
+                rows = [e for e in rows if e["Ticket"] and e["Ticket"]["Id"] in tickets]
+            rows, pag = paginate(rows, q)
             return self.reply(200, env(rows, pag))
 
         if path == "/v1/contracts":
