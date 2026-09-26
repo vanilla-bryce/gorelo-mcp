@@ -10,7 +10,10 @@
 #   GORELO_API_KEY       required
 #   GORELO_MY_EMAIL      required for assignee "me"
 #   GORELO_BASE_URL      default https://api.aue.gorelo.io
-#   GORELO_ALLOW_WRITES  "true" enables the two write tools. Default off.
+#   GORELO_ALLOW_WRITES  "true" enables the four write tools. Default off.
+#   GORELO_DOWNLOAD_DIR  where invoice PDFs are saved. Default ~/gorelo-invoices
+#   GORELO_ATTACH_DIR    the ONLY folder comment attachments come from.
+#                        Default ~/gorelo-attachments
 #
 # stdout is the MCP transport. Diagnostics go to stderr, always.
 
@@ -20,7 +23,7 @@ require_relative 'lib/gorelo_tools'
 require_relative 'lib/gorelo_billing_tools'
 require_relative 'lib/gorelo_uptime_tools'
 
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 
 def load_dotenv(path)
   return unless File.exist?(path)
@@ -63,8 +66,13 @@ server = McpStdio::Server.new(
     API "ServiceLine" is what the UI calls a CONTRACT. Say both when reporting one, or
     the user will compare it to their screen and conclude the data is wrong.
 
-    Only gorelo_add_ticket_comment and gorelo_update_ticket write, and both are off
-    unless explicitly enabled.
+    INVOICES created here are ALWAYS Drafts; approving one pushes it to the accounting
+    system and is left to a person in Gorelo. Downloading an invoice PDF is recorded by
+    Gorelo as an export event on that invoice, so do not download one just to read it.
+
+    Four tools write - gorelo_add_ticket_comment, gorelo_update_ticket,
+    gorelo_set_uptime_maintenance and gorelo_create_draft_invoice - and all are off
+    unless explicitly enabled. Nothing here can delete anything.
   TEXT
 )
 

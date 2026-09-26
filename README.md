@@ -7,7 +7,7 @@ It runs on your own machine and speaks [MCP](https://modelcontextprotocol.io) ov
 stdin/stdout. Nothing is hosted, nothing is exposed to the internet, and your API key never
 leaves your computer.
 
-**Sixteen tools, fourteen of them read-only.** Plain Ruby — **no gems, no Bundler, no build step.**
+**Twenty-three tools, nineteen of them read-only.** Plain Ruby — **no gems, no Bundler, no build step.**
 
 > ### ⚠️ Correction — 11 September 2026
 >
@@ -136,10 +136,12 @@ Restart your MCP client. Then ask it something like *"list my open Gorelo ticket
 
 | Variable | |
 |---|---|
-| `GORELO_API_KEY` | **Required.** Make it read-only to start with — only one tool writes. |
+| `GORELO_API_KEY` | **Required.** Make it read-only to start with — only four tools write. |
 | `GORELO_MY_EMAIL` | **Required** for `assignee: "me"`. Must match your Gorelo user exactly. |
 | `GORELO_BASE_URL` | Defaults to `https://api.aue.gorelo.io`. Change for other regions. |
-| `GORELO_ALLOW_WRITES` | `true` enables the two write tools. Off by default. |
+| `GORELO_ALLOW_WRITES` | `true` enables the four write tools. Off by default. |
+| `GORELO_DOWNLOAD_DIR` | Where `gorelo_get_invoice_pdf` saves PDFs. Defaults to `~/gorelo-invoices`. |
+| `GORELO_ATTACH_DIR` | The **only** folder comment attachments can come from. Defaults to `~/gorelo-attachments`. |
 
 ---
 
@@ -160,8 +162,15 @@ Restart your MCP client. Then ask it something like *"list my open Gorelo ticket
 | `gorelo_list_contracts` | | Contract **groups** (what the UI calls contracts' parent invoice) with their service lines, recurring amount, cost and margin |
 | `gorelo_billing_roles` | | The sell-rate table — what an hour is worth under each role |
 | `gorelo_work_types` | | Multipliers and per-entry minimum times — the two fields that change an invoice without changing the hours |
-| `gorelo_add_ticket_comment` | **yes** | One of two writes. Off by default. |
+| `gorelo_list_invoices` | | Invoices by client, status, contract or date — names the ones approved but never emailed, and the overdue |
+| `gorelo_get_invoice_pdf` | | Saves an invoice PDF to a local folder. ⚠ Gorelo logs every download as an export event |
+| `gorelo_get_contract` | | One contract group in full: schedule, service lines, labour terms, line items |
+| `gorelo_list_items` | | The product and bundle catalogue with category, tax and margin; a bundle against its parts |
+| `gorelo_list_uptime` | | Uptime checks and their maintenance windows — names the ones that never expire |
+| `gorelo_add_ticket_comment` | **yes** | Adds a comment, optionally with files from one folder. Off by default. |
 | `gorelo_update_ticket` | **yes** | Sets a ticket's client or status — nothing else. Off by default. |
+| `gorelo_set_uptime_maintenance` | **yes** | Starts or ends a maintenance window on one check — nothing else. Off by default. |
+| `gorelo_create_draft_invoice` | **yes** | Raises a manual invoice, always as a Draft. Off by default. |
 | `gorelo_api_probe` | | Raw `GET` on any `/v1/…` path, for exploring |
 
 ### The write tools
@@ -213,17 +222,76 @@ query parameters, so a mistyped payload field returns `200` and changes nothing.
 read-back, a write that never happened is indistinguishable from one that did. When the check
 fails the tool says so loudly, names the likely cause, and prints the payload it sent.
 
+#### `gorelo_set_uptime_maintenance`
+
+Starts or ends a maintenance window on **one** uptime check, and sends **only**
+`MaintenanceMode` — never the target, type, client or tags. A check in maintenance raises no
+alerts, so the risk here is silence, not damage:
+
+- `start` needs a **reason** and a **duration** (1–10,080 minutes). A duration of `0` means the
+  window never ends, so it can only be sent with **`indefinite: true`** — never from a default,
+  a missing value or a typo.
+- The PATCH has no "updated by" field, so the reason is prefixed **`[Gorelo MCP]`**.
+- The check is read back, as `gorelo_update_ticket` does, because this API accepts and ignores
+  fields it doesn't recognise. On a `start`, the read-back compares the **reason as well as the
+  duration**, so a replacement window Gorelo accepted but ignored — leaving the old window's
+  duration and reason in place — is reported as failed, not verified.
+
+`gorelo_list_uptime` names every window that never expires or has run more than seven days.
+
+#### `gorelo_create_draft_invoice`
+
+Raises a manual invoice against one client, **always as a Draft**. `StatusId` is hard-coded to
+`1` and there is no parameter to change it: approving an invoice pushes it to Xero/QuickBooks,
+and that stays a person's decision, made in Gorelo.
+
+- Each line names a catalogue item by id or **exact** name. A partial or ambiguous name is
+  refused with the candidates — an invoice line never lands on a guessed product.
+- **Every line is checked before anything is sent**, and every problem is reported at once.
+- **No `RecipientEmails`** is ever sent. Cost, tax, account code and billable status come from
+  the item.
+- An identical invoice within 24 hours is refused, using the same fingerprint log as comments.
+- The POST returns only an id and there is no `GET /v1/invoices/{id}`, so the tool lists that
+  client's invoices created since just before the call and finds the id — then reports the
+  number, status and totals as Gorelo computed them.
+
+**A server error on a POST is never retried** — for invoices and comments alike. A 5xx says
+nothing about whether the write was applied, and retrying a POST that *was* applied raises a
+second invoice. A read timeout waiting for Gorelo's reply is treated the same way: the request
+may already have reached the server, so it is just as ambiguous as a 5xx and is likewise never
+retried. The reply says it *may* exist, and the fingerprint is recorded so a repeat is
+refused. A 429 is still retried: a rate-limited request was never processed.
+
+#### Attachments on `gorelo_add_ticket_comment`
+
+`files` attaches files to a comment, uploading them first with `POST /v1/attachments`. **Only
+files in `GORELO_ATTACH_DIR`** (default `~/gorelo-attachments`) can be attached. Ticket text is
+untrusted input the assistant reads; without a fixed folder, a crafted ticket could talk it
+into attaching `~/.ssh/id_rsa` or this project's `.env` to a public comment. Paths are resolved
+with `realpath` **before** the check, so `..`, `~` and symlinks can't step outside. Each file
+must be under Gorelo's 44 MB limit, and every check runs before any upload.
+
+At most **10 files** can be attached to one comment, with duplicate names collapsed before
+that count is checked, so passing the same file name twice doesn't cost two of the ten.
+
+If an upload or the comment fails after some files were uploaded, those files stay on the
+ticket with nothing referencing them — the API has no way to remove them — and the reply names
+them; a file whose own upload failed ambiguously (a 5xx or timeout after the POST reached
+Gorelo) is instead named as one that "MAY have been uploaded," since there's no id back to
+confirm it landed.
+
 ### There is no DELETE, anywhere
 
 Gorelo now exposes `DELETE` for tickets, clients, contacts, agent assets, custom assets,
-private comments and time entries. **None of it is reachable from here, and the guarantee is
-structural rather than a policy**: `Gorelo::Client` has `get`, `post` and `patch` methods and
-no `delete` method at all. A tool cannot call a method that does not exist.
+private comments and time entries — and, since 25 September 2026, invoices, contracts, items
+and uptime checks. **None of it is reachable from here, and the guarantee is structural rather
+than a policy**: `Gorelo::Client` has `get`, `get_binary`, `post`, `post_multipart` and `patch`
+methods and no `delete` method at all. A tool cannot call a method that does not exist.
 
 `gorelo_api_probe` is likewise GET-only — it has no `method` parameter to pass, which the test
 suite asserts against the published tool schema.
 
-Leave both write tools off until the read tools have earned their place.
+Leave the write tools off until the read tools have earned their place.
 
 ---
 
@@ -268,6 +336,12 @@ Confirmed working:
 /v1/contracts                     GET   ← since 2026-09-04. "Contract GROUPS" in the UI
 /v1/billing-roles                 GET   ← since 2026-09-04. Small, unpaginated
 /v1/work-types                    GET   ← since 2026-09-04. Small, unpaginated
+/v1/invoices                      GET, POST   ← since 2026-09-25. POST used for Drafts only
+/v1/invoices/{id}/pdf             GET   ← since 2026-09-25. A file, not the envelope
+/v1/contracts/{id}                GET   ← since 2026-09-25. Service lines with line items
+/v1/items | /{id} | /categories   GET   ← since 2026-09-25
+/v1/taxes                         GET   ← since 2026-09-25. Small, unpaginated
+/v1/uptime | /{id}                GET, PATCH (MaintenanceMode only)  ← since 2026-09-25
 ```
 
 `GET /v1/time-entries/statuses` is a **404**. It looks like it ought to exist, by analogy
@@ -334,7 +408,20 @@ was checked against, every work type rounds, so no entry in the previous 30 days
 affected — but a tenant, or a work type, without rounding would have been.
 
 The same release added invoices, the item catalogue, taxes, full contract detail, uptime
-checks and a general attachment upload. They aren't used by this server yet.
+checks and a general attachment upload, and the tools above use all of them. Three things
+about them are easy to miss:
+
+- **Downloading an invoice PDF is not a pure read.** Gorelo records each download against the
+  invoice as an export event.
+- **`PageSize` outside 1–200 is a 400** on `/v1/invoices`, `/v1/items` and `/v1/uptime`, not
+  clamped as on the older endpoints.
+- **Subcategory ids are not unique.** They are issued independently of category ids, so one
+  number can name a subcategory under two categories. Look one up only inside its own
+  category.
+
+A fourth wrinkle sits in `gorelo_list_items` rather than the API itself: when a bundle's part
+has no cost or price, the tool prints the bundle's sum-of-parts as **"unknown"** rather than
+silently counting the missing part as zero, which would understate the total without saying so.
 
 ### Contracts: the API and the UI use the same words for different things
 
@@ -473,10 +560,12 @@ python3 test/mock_gorelo.py       # in one terminal
 python3 test/drive.py             # in another
 ```
 
-104 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
+187 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
 assisting assignees, watcher-only exclusion, closed-ticket exclusion, lookup by number,
 deleted comments, cursor pagination, rate-limit retry, every write guard, and the protocol
-edge cases (unknown method, unknown tool, malformed input).
+edge cases (unknown method, unknown tool, malformed input). The driver sets
+`GORELO_READ_TIMEOUT` low so a read timeout on a POST can be reproduced in well under a
+second instead of waiting on the real 60-second default.
 
 The fake tenant carries 225 time entries — enough to force a second cursor page — including
 **two technicians logging time on one ticket**, which is precisely the case the old
