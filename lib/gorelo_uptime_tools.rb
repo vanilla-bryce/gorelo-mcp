@@ -33,6 +33,14 @@ module GoreloUptimeTools
     t['Port'] ? "#{t['Ip']}:#{t['Port']}" : t['Ip'].to_s
   end
 
+  # What to call a check. Gorelo allows an empty description - the API sends
+  # "" - and a blank row can be neither read nor selected, so such a check is
+  # named by what it watches.
+  def label(check)
+    desc = check['Description'].to_s.strip
+    desc.empty? ? "#{target(check)} (no description)" : desc
+  end
+
   # [in_maintenance, text, flags]. A duration of 0 means the window never ends.
   def maintenance(check, now = Time.now.utc)
     m = check['MaintenanceMode'] || {}
@@ -134,13 +142,16 @@ module GoreloUptimeTools
       out << ('-' * 134)
       rows.first(limit).each do |c|
         client = c['ClientId'] ? (api.client_name(c['ClientId']) || "client #{c['ClientId']}") : '(no client)'
-        out << "#{pad(c['Description'] || c['Id'], 32)}#{pad(client, 22)}" \
+        out << "#{pad(label(c), 32)}#{pad(client, 22)}" \
                "#{pad(nested(c, 'Type', 'Name'), 6)}#{pad(target(c), 34)}" \
                "#{pad(nested(c, 'Status', 'Name'), 10)}#{info[c['Id']][1]}"
+        # Its target always selects it too, but the id is the one handle that
+        # cannot be ambiguous.
+        out << "#{' ' * 4}↳ no description - select it by target or by id #{c['Id']}" if c['Description'].to_s.strip.empty?
       end
       out << "#{rows.size - limit} more not shown - raise limit." if rows.size > limit
 
-      flagged = rows.flat_map { |c| info[c['Id']][2].map { |f| "#{c['Description'] || c['Id']}: #{f}" } }
+      flagged = rows.flat_map { |c| info[c['Id']][2].map { |f| "#{label(c)}: #{f}" } }
       unless flagged.empty?
         out << ''
         flagged.each { |f| out << "⚠ #{f}" }
@@ -149,18 +160,23 @@ module GoreloUptimeTools
     end
   end
 
-  # One check by id, or by a description fragment matching EXACTLY one.
+  # One check by id, or by a fragment of its description - or, failing that,
+  # of its target (IP or URL) - that matches EXACTLY one. The target fallback
+  # is how a check with no description is reached; Gorelo's Query only
+  # searches descriptions, so it costs one unfiltered sweep, only when needed.
   def find_check(api, ref)
     ref = ref.to_s.strip
-    return [nil, 'Give an uptime check id or a fragment of its description.'] if ref.empty?
+    return [nil, 'Give an uptime check id, or a fragment of its description or target.'] if ref.empty?
     return [api.get("/v1/uptime/#{ref}")['Data'], nil] if ref.match?(GUID)
 
+    needle = ref.downcase
     hits = api.get_all('/v1/uptime', { 'Query' => ref[0, 200] })
-              .select { |c| c['Description'].to_s.downcase.include?(ref.downcase) }
-    return [nil, "No uptime check description contains #{ref.inspect}."] if hits.empty?
+              .select { |c| c['Description'].to_s.downcase.include?(needle) }
+    hits = api.get_all('/v1/uptime').select { |c| target(c).downcase.include?(needle) } if hits.empty?
+    return [nil, "No uptime check description or target contains #{ref.inspect}."] if hits.empty?
     if hits.size > 1
       return [nil, "#{hits.size} uptime checks match #{ref.inspect}: " \
-                   "#{hits.first(10).map { |c| c['Description'] }.join('; ')}. Narrow it, or give the id."]
+                   "#{hits.first(10).map { |c| label(c) }.join('; ')}. Narrow it, or give the id."]
     end
 
     [hits.first, nil]
@@ -186,7 +202,7 @@ module GoreloUptimeTools
       input_schema: {
         type: 'object',
         properties: {
-          check:      { type: 'string', description: 'Uptime check id, or a fragment of its description matching exactly one check.' },
+          check:      { type: 'string', description: 'Uptime check id, or a fragment of its description - or of its target IP/URL - matching exactly one check.' },
           action:     { type: 'string', enum: %w[start end] },
           minutes:    { type: 'integer', description: 'Length of the window, 1-10080. Required to start, unless indefinite.' },
           indefinite: { type: 'boolean', description: 'true: the window never expires. Only to start, and only on purpose.' },
@@ -229,7 +245,7 @@ module GoreloUptimeTools
       check, why = find_check(api, args['check'])
       next "#{why} Nothing was written." unless check
 
-      label  = check['Description'] || check['Id']
+      label  = label(check)
       before = check['MaintenanceMode'] || {}
       next "#{label} is not in maintenance. Nothing was written." if action == 'end' && !before['Enabled']
 

@@ -499,6 +499,11 @@ def run_suite():
 
     print("\nuptime checks")
     up = s.call("gorelo_list_uptime")
+    blank = next((l for l in up.splitlines() if "192.0.2.55" in l), "")
+    check("a check with no description is labelled by its target, not left blank",
+          blank.startswith("192.0.2.55 (no description)"), blank)
+    check("and its id is shown so it can always be selected",
+          "0b700000-0000-4000-8000-000000000005" in up, up[-900:])
     check("every check is listed with its target",
           "203.0.113.10" in up and "198.51.100.7:443" in up
           and "https://portal.contoso.example" in up, up[:900])
@@ -639,6 +644,15 @@ def run_suite():
           silent[:600])
 
     print("\nuptime maintenance")
+    B = "/v1/uptime/0b700000-0000-4000-8000-000000000005"
+    by_target = s2.call("gorelo_set_uptime_maintenance", check="192.0.2.55", action="start",
+                        minutes=5, reason="Target test", confirm=True)
+    check("a check with no description can be selected by its target",
+          "Started maintenance on 192.0.2.55 (no description)" in by_target
+          and "MaintenanceMode" in last_body(B), by_target)
+    by_id = s2.call("gorelo_set_uptime_maintenance", check="0b700000-0000-4000-8000-000000000005",
+                    action="end", confirm=True)
+    check("and ended by the id the list shows", "Ended maintenance on 192.0.2.55" in by_id, by_id)
     U = "/v1/uptime/0b700000-0000-4000-8000-000000000001"
     check("confirm required", "confirm must be true" in
           s2.call("gorelo_set_uptime_maintenance", check="head office", action="start",

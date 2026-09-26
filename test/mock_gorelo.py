@@ -675,6 +675,9 @@ UPTIME = [
     # ignored-write regression test in drive.py.
     uptime(4, "Tailspin - website", 2, 11004, "Up", {"Url": "https://tailspin.example"},
            window(9, 10080, "Site rebuild"), created=40),
+    # No description at all - the real API sends "" - so it can only be found
+    # by what it watches, or by its id.
+    uptime(5, "", 1, 11005, "Up", {"Ip": "192.0.2.55"}, created=50),
 ]
 
 

@@ -246,6 +246,11 @@ alerts, so the risk here is silence, not damage:
 
 `gorelo_list_uptime` names every window that never expires or has run more than seven days.
 
+A check is chosen by id, or by a fragment of its description **or of its target** (IP or
+URL) that matches exactly one check. Gorelo allows a check with no description at all; the
+list names such a check by its target and prints its id underneath, since a blank row can be
+neither read nor selected.
+
 #### `gorelo_create_draft_invoice`
 
 Raises a manual invoice against one client, **always as a Draft**. `StatusId` is hard-coded to
