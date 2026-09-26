@@ -287,6 +287,15 @@ def run_suite():
     check("the retired 'unverified parameter' hedging is gone",
           "unverified" not in narrow and "IGNORED" not in narrow, narrow[:800])
 
+    two = s.call("gorelo_time_report", assignee="anyone", days=400, client="Wingtip,Contoso",
+                 group_by="client")
+    tq = last_query("/v1/tickets")
+    check("grouping several clients sweeps only THEIR tickets, not the whole tenant",
+          set(tq.get("ClientIds", "").split(",")) == {"11002", "11006"}, tq)
+    check("and every entry is resolved to one of them",
+          "Contoso" in two and "Wingtip" in two and "CLIENT UNRESOLVED" not in two
+          and "tickets of those 2 clients" in two, two[:1200])
+
     alex = s.call("gorelo_time_report", assignee="alex", days=400, group_by="technician")
     check("an assignee filter keeps only that technician's own entries",
           "Alex Kim" in alex and "Sam Rivers" not in alex, alex[:900])
@@ -427,6 +436,15 @@ def run_suite():
           and not os.path.exists(os.path.join(ENV["HOME"], "evil.pdf")), evil)
     check("an unknown number is named",
           "No invoice numbered" in s.call("gorelo_get_invoice_pdf", invoice="INV-7777"))
+    debug("ignore-filter", name="Number")
+    try:
+        loose = s.call("gorelo_get_invoice_pdf", invoice="INV-1042")
+        check("an invoice number is matched exactly, even if Number is not honoured",
+              "Saved INV-1042" in loose, loose)
+        check("and a number nothing matches is still named, never the first row",
+              "No invoice numbered 7777" in s.call("gorelo_get_invoice_pdf", invoice="INV-7777"))
+    finally:
+        debug("honour-filters")
     gone = s.call("gorelo_get_invoice_pdf", invoice="00000000-0000-4000-8000-000000000000")
     check("an unknown id surfaces Gorelo's 404, not an empty file", "404" in gone, gone)
 
@@ -728,6 +746,13 @@ def run_suite():
                     reference="MCP-TEST", confirm=True)
     check("an identical invoice within 24h is refused",
           "Refused" in again and "already raised" in again, again)
+    h0 = hits(P)
+    same = s2.call("gorelo_create_draft_invoice", client="Fabrikam",
+                   lines=[{"item": "Managed desktop seat", "quantity": 2.0},
+                          {"item": "New starter bundle", "quantity": 1.0, "unit_price": 1850.0}],
+                   reference="MCP-TEST", confirm=True)
+    check("2 and 2.0 are the same quantity - the repeat is still refused",
+          "already raised" in same and hits(P) == h0, same)
     h0 = hits(P)
     boom = s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
                    reference="BOOM-500", confirm=True)

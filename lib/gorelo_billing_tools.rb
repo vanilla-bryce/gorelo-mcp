@@ -178,7 +178,10 @@ module GoreloBillingTools
     num = ref.sub(/\AINV-?/i, '')
     return [nil, "#{ref.inspect} is not an invoice number or id."] unless num.match?(/\A\d+\z/)
 
-    row = Array(api.get('/v1/invoices', { 'Number' => num.to_i })['Data']).first
+    # Matched exactly rather than taking the first row: the API ignores a
+    # filter it does not honour, and would then return every invoice.
+    row = Array(api.get('/v1/invoices', { 'Number' => num.to_i })['Data'])
+          .find { |i| i['Number'].to_s == num.to_i.to_s }
     row ? [row, nil] : [nil, "No invoice numbered #{num.to_i}."]
   end
 
@@ -560,6 +563,17 @@ module GoreloBillingTools
     [nil, "#{label} #{value.inspect} is not a date (YYYY-MM-DD)."]
   end
 
+  def invoice_fingerprint_basis(payload)
+    num = ->(v) { v.nil? ? nil : v.to_r.to_s }
+    payload.merge(
+      'Reference' => payload['Reference'].to_s.strip,
+      'LineItems' => payload['LineItems'].map do |li|
+        li.merge('Quantity' => num.call(li['Quantity']), 'UnitPrice' => num.call(li['UnitPrice']),
+                 'Description' => li['Description'].to_s.strip)
+      end
+    )
+  end
+
   def create_draft_invoice(server, api)
     server.tool(
       name:  'gorelo_create_draft_invoice',
@@ -601,7 +615,7 @@ module GoreloBillingTools
           },
           reference:    { type: 'string', description: 'Optional invoice reference, e.g. a PO number.' },
           invoice_date: { type: 'string', description: 'YYYY-MM-DD. Default today.' },
-          due_date:     { type: 'string', description: 'YYYY-MM-DD. Default: the invoice date.' },
+          due_date:     { type: 'string', description: "YYYY-MM-DD. Default: Gorelo's own (normally the invoice date)." },
           confirm:      { type: 'boolean', description: 'Must be true. Nothing is created without it.' }
         },
         required: %w[client lines confirm],
@@ -666,13 +680,17 @@ module GoreloBillingTools
       # UnitCost, TaxId, CoaCode, BillableStatusId and DiscountPercent, which
       # fall back to the item's own values.
 
-      key = api.fingerprint('invoice', payload.to_json)
+      # The fingerprint is taken from a NORMALISED copy, so a retry that says
+      # 2.0 where the first call said 2, or pads a description, is still
+      # recognised as the same invoice. The payload sent is unchanged.
+      key = api.fingerprint('invoice', invoice_fingerprint_basis(payload).to_json)
       if api.write_fingerprint_seen?(key)
         next "Refused: an identical draft invoice for #{client['Name']} was already raised in the " \
              'last 24 hours. Nothing was created. Change the reference if a second one is really wanted.'
       end
 
-      before = Time.now.utc - 120
+      # Matching is by Id, so a wide window costs nothing and survives clock skew.
+      before = Time.now.utc - 86_400
       begin
         id = api.post('/v1/invoices', payload).dig('Data', 'Id')
       rescue Gorelo::AmbiguousWrite => e

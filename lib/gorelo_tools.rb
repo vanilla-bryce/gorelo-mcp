@@ -1047,10 +1047,13 @@ module GoreloTools
           sole       = matched.first['Id']
           index_note = 'Filtered by the API with ClientIds; one client matched, so no lookup was needed.'
         elsif group_by == 'client'
-          index      = api.ticket_client_index
+          # Only these clients' tickets are needed, so the sweep is scoped with
+          # ClientIds rather than indexing the whole tenant.
+          index = api.get_all('/v1/tickets', { 'ClientIds' => filters['ClientIds'] })
+                     .each_with_object({}) { |t, h| h[t['Id'].to_s] = t['ClientId'] }
           index_note = "Filtered by the API with ClientIds. Entries carry no client, so grouping " \
-                       "#{matched.size} clients took ONE paged sweep of /v1/tickets (cached for " \
-                       'this process), not one fetch per entry.'
+                       "#{matched.size} clients took ONE paged sweep of the #{index.size} " \
+                       "tickets of those #{matched.size} clients, not one fetch per entry."
         else
           index_note = 'Filtered by the API with ClientIds, so no lookup was needed.'
         end

@@ -972,7 +972,7 @@ class Handler(BaseHTTPRequestHandler):
                 want = q_ids(q, name)
                 if want is not None:
                     rows = [i for i in rows if str(key(i)) in want]
-            if q.get("Number"):
+            if q.get("Number") and "Number" not in IGNORED_FILTERS:
                 rows = [i for i in rows if str(i["Number"]) == q["Number"][0]]
             if q.get("InvoiceDateSince"):
                 rows = [i for i in rows if i["InvoiceDate"] >= q["InvoiceDateSince"][0][:10]]
