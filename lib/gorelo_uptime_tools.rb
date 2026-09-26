@@ -234,10 +234,22 @@ module GoreloUptimeTools
       next "#{label} is not in maintenance. Nothing was written." if action == 'end' && !before['Enabled']
 
       payload = { 'MaintenanceMode' => mode }
+      key     = api.fingerprint(check['Id'], payload.to_json)
       begin
         api.patch("/v1/uptime/#{check['Id']}", payload)
+        patch_error = nil
+      rescue Gorelo::AuthError, Gorelo::WritesDisabled => e
+        next "Gorelo refused the change to #{label}: #{e.message} Nothing was written."
+      rescue Gorelo::HttpError => e
+        # A 4xx is Gorelo saying no, so nothing was applied. Any other status
+        # falls through to the may-have-been-applied path below.
+        next "Gorelo refused the change to #{label}: #{e.message}" if e.status.between?(400, 499)
+
+        patch_error = e
       rescue Gorelo::Error => e
-        next "Gorelo refused the change to #{label}: #{e.message}"
+        # A read timeout, a dropped connection, or a 5xx that outlasted the
+        # retries: the PATCH may well have landed. Never report that as refused.
+        patch_error = e
       end
 
       after = begin
@@ -246,8 +258,14 @@ module GoreloUptimeTools
         nil
       end
       unless after.is_a?(Hash)
-        api.record_write(api.fingerprint(check['Id'], payload.to_json),
-                         "PATCH /v1/uptime/#{check['Id']} #{payload.to_json} → UNVERIFIED (read-back failed)")
+        if patch_error
+          api.record_write(key, "PATCH /v1/uptime/#{check['Id']} #{payload.to_json} → UNVERIFIED " \
+                                "(PATCH error: #{patch_error.message.lines.first.to_s.strip}; read-back failed)")
+          next "⚠ The change to #{label} MAY have been applied: #{patch_error.message}\n" \
+               'Reading the check back ALSO failed, so its state is unknown. Check it in Gorelo before ' \
+               'trying again.'
+        end
+        api.record_write(key, "PATCH /v1/uptime/#{check['Id']} #{payload.to_json} → UNVERIFIED (read-back failed)")
         next "⚠ Sent the change to #{label} but could NOT read the check back to confirm it. Check in Gorelo."
       end
 
@@ -266,8 +284,21 @@ module GoreloUptimeTools
 
       # Audit trail, as for gorelo_update_ticket. Re-applying a window is
       # harmless, so this records rather than refuses.
-      api.record_write(api.fingerprint(check['Id'], payload.to_json),
-                       "PATCH /v1/uptime/#{check['Id']} #{payload.to_json} → #{took ? 'applied' : 'NO EFFECT'}")
+      if patch_error
+        api.record_write(key, "PATCH /v1/uptime/#{check['Id']} #{payload.to_json} → UNVERIFIED " \
+                              "(PATCH error: #{patch_error.message.lines.first.to_s.strip}; read-back " \
+                              "#{took ? 'shows it applied' : 'shows NO EFFECT'})")
+        state = maintenance(after)[1]
+        state = 'not in maintenance' if state == '-'
+        next "⚠ The change to #{label} MAY have been applied: #{patch_error.message}\n" \
+             "Reading it back shows: #{state}. " +
+             (took ? 'That shows the change in effect, so it very probably landed - but Gorelo ' \
+                     'reported an error, so check the check in Gorelo.'
+                   : "That does NOT show the intended change (sent: #{payload.to_json}). It may " \
+                     'not have landed, or may yet - check in Gorelo before trying again.')
+      end
+
+      api.record_write(key, "PATCH /v1/uptime/#{check['Id']} #{payload.to_json} → #{took ? 'applied' : 'NO EFFECT'}")
 
       unless took
         next "⚠ DID NOT TAKE EFFECT. Gorelo accepted the change to #{label}, but reading it back shows " \

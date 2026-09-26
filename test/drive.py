@@ -637,6 +637,30 @@ def run_suite():
     check("an ignored replacement window is caught, not reported as verified",
           "DID NOT TAKE EFFECT" in replaced and "Verified" not in replaced, replaced)
 
+    # Guards: each is refused before anything is sent.
+    b0 = last_body(U)
+    for label, kw in [("minutes over a week", dict(minutes=10081)),
+                      ("minutes AND indefinite", dict(minutes=60, indefinite=True)),
+                      ("an unknown action", dict(action="pause", minutes=60))]:
+        a = dict(check="head office", action="start", reason="Guard test", confirm=True)
+        a.update(kw)
+        r = s2.call("gorelo_set_uptime_maintenance", **a)
+        check("refused, nothing sent: " + label,
+              "Refused" in r and "Nothing was written" in r and last_body(U) == b0, r)
+    # Contoso's check APPLIES a BOOM-500 change, then answers 500. That is a
+    # write that landed; it must never be reported as refused.
+    boomu = s2.call("gorelo_set_uptime_maintenance", check="client portal", action="start",
+                    minutes=30, reason="BOOM-500 test", confirm=True)
+    check("a PATCH that errors after landing is reported as MAY-have-been-applied",
+          "MAY have been applied" in boomu and "refused" not in boomu, boomu)
+    check("and the read-back state is reported, and says it matches",
+          "BOOM-500 test" in boomu and "shows the change in effect" in boomu, boomu)
+    check("and it is in the audit log as UNVERIFIED",
+          any("UNVERIFIED" in l and "PATCH error" in l for l in open(WRITE_LOG)), "")
+    restored = s2.call("gorelo_set_uptime_maintenance", check="client portal", action="end",
+                       confirm=True)
+    check("and it can be ended again", "Ended maintenance" in restored, restored)
+
     print("\ndraft invoices")
     P = "/v1/invoices"
     LINES = [{"item": "Managed desktop seat", "quantity": 2},

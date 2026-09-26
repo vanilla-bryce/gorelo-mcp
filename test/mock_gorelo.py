@@ -816,6 +816,10 @@ class Handler(BaseHTTPRequestHandler):
             hit["MaintenanceMode"] = (
                 {k: mm.get(k) for k in ("Enabled", "StartDateTime", "DurationInMinutes", "Reason")}
                 if mm.get("Enabled") else dict(NO_WINDOW))
+        # BOOM-500 on Contoso's check: the change IS applied, then the request
+        # fails - a PATCH that may (here: did) land must not read as "refused".
+        if hit["Description"].startswith("Contoso") and "BOOM-500" in (mm.get("Reason") or ""):
+            return self.reply(500, fail(500, "Internal server error"))
         return self.reply(200, env({"Id": check_id}))
 
     def do_GET(self):
