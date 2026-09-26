@@ -658,9 +658,11 @@ UPTIME = [
     # Duration 0: the window never ends, and has been silencing alerts for 30 days.
     uptime(3, "Fabrikam - VPN", 3, 11003, "Up", {"Ip": "198.51.100.7", "Port": 443},
            window(30, 0, "Firewall replacement"), created=30),
-    # A two-week window, nine days in.
+    # A one-week window, nine days in (so it is already stale) - the max the
+    # write tool's own MAX_WINDOW_MINUTES allows, which matters for the
+    # ignored-write regression test in drive.py.
     uptime(4, "Tailspin - website", 2, 11004, "Up", {"Url": "https://tailspin.example"},
-           window(9, 20160, "Site rebuild"), created=40),
+           window(9, 10080, "Site rebuild"), created=40),
 ]
 
 

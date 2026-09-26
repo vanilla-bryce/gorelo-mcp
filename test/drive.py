@@ -604,6 +604,13 @@ def run_suite():
     ignored = s2.call("gorelo_set_uptime_maintenance", check="Tailspin", action="end", confirm=True)
     check("an accepted-but-ignored change is reported as FAILED",
           "DID NOT TAKE EFFECT" in ignored, ignored)
+    # 10080 (not the coordinator's literal 20160) - the fixture's stored duration is
+    # now 10080, the max the tool's own MAX_WINDOW_MINUTES allows; 20160 would be
+    # refused by that guard before ever reaching the read-back logic under test.
+    replaced = s2.call("gorelo_set_uptime_maintenance", check="Tailspin", action="start",
+                       minutes=10080, reason="Rebuild extended", confirm=True)
+    check("an ignored replacement window is caught, not reported as verified",
+          "DID NOT TAKE EFFECT" in replaced and "Verified" not in replaced, replaced)
     s2.close()
     ENV["GORELO_ALLOW_WRITES"] = "false"
 

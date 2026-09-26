@@ -246,12 +246,23 @@ module GoreloUptimeTools
         nil
       end
       unless after.is_a?(Hash)
-        next "Sent the change to #{label} but could NOT read the check back to confirm it. Check in Gorelo."
+        api.record_write(api.fingerprint(check['Id'], payload.to_json),
+                         "PATCH /v1/uptime/#{check['Id']} #{payload.to_json} → UNVERIFIED (read-back failed)")
+        next "⚠ Sent the change to #{label} but could NOT read the check back to confirm it. Check in Gorelo."
       end
 
       now_mode = after['MaintenanceMode'] || {}
+      # For a start, Enabled and DurationInMinutes alone are not enough: a check
+      # already in a window of the SAME duration whose PATCH is accepted-and-
+      # ignored would read back identical to the old window on both fields, and
+      # get reported as verified. Reason (always freshly attributed here) and a
+      # non-nil DurationInMinutes close that gap. StartDateTime is deliberately
+      # never compared - the real API may reformat timestamps on the way back.
       took = now_mode['Enabled'] == mode['Enabled'] &&
-             (action == 'end' || now_mode['DurationInMinutes'].to_i == mode['DurationInMinutes'])
+             (action == 'end' ||
+              (!now_mode['DurationInMinutes'].nil? &&
+               now_mode['DurationInMinutes'].to_i == mode['DurationInMinutes'] &&
+               now_mode['Reason'] == mode['Reason']))
 
       # Audit trail, as for gorelo_update_ticket. Re-applying a window is
       # harmless, so this records rather than refuses.
