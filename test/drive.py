@@ -105,6 +105,12 @@ def hits(path):
         return json.load(r)["count"]
 
 
+def debug(route, **params):
+    url = ENV["GORELO_BASE_URL"] + "/__debug/" + route + "?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(url) as r:
+        return json.load(r)
+
+
 def uploads():
     with urllib.request.urlopen(ENV["GORELO_BASE_URL"] + "/__debug/uploads") as r:
         return json.load(r)
@@ -352,6 +358,32 @@ def run_suite():
     empty = s.call("gorelo_list_time_entries", client="Wingtip", user="alex", days=3)
     check("an empty result says how many rows it looked at",
           "No time entries" in empty and "came back from /v1/time-entries" in empty, empty)
+
+    # The API ignores names it does not recognise. If it ever stops honouring
+    # UserIds or TicketIds, the rows are re-checked locally and the reply says so.
+    def total_line(text):
+        return next((l for l in text.splitlines() if l.startswith("TOTAL")), text[:300])
+    base_rep = s.call("gorelo_time_report", assignee="alex", days=30)
+    debug("ignore-filter", name="UserIds")
+    try:
+        mine2 = s.call("gorelo_list_time_entries", ticket="G-1000", user="alex", days=30)
+        check("an ignored UserIds filter is re-applied locally, not trusted",
+              "Alex Kim" in mine2 and "Sam Rivers" not in mine2, mine2[:600])
+        check("and the reply names the filter the API did not honour",
+              "do not match UserIds" in mine2, mine2[:600])
+        rep2 = s.call("gorelo_time_report", assignee="alex", days=30)
+        check("time_report re-applies an ignored UserIds too, and says so",
+              total_line(rep2) == total_line(base_rep) and "do not match UserIds" in rep2,
+              (total_line(base_rep), rep2[:900]))
+    finally:
+        debug("honour-filters")
+    debug("ignore-filter", name="TicketIds")
+    try:
+        te2 = s.call("gorelo_list_time_entries", ticket="G-1000", days=30)
+        check("an ignored TicketIds filter is re-applied locally, and named",
+              "2 time entr(ies)" in te2 and "do not match TicketIds" in te2, te2[:600])
+    finally:
+        debug("honour-filters")
 
     print("\ninvoices (Gorelo, 25 Sep 2026)")
     inv = s.call("gorelo_list_invoices")

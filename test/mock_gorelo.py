@@ -680,6 +680,11 @@ UPTIME = [
 
 POSTED = []
 
+# Query names /v1/time-entries has been told to IGNORE, standing in for the API
+# no longer honouring a documented filter. Set via /__debug/ignore-filter?name=X
+# and cleared via /__debug/honour-filters.
+IGNORED_FILTERS = set()
+
 
 def env(data, pagination=None):
     return {"StatusCode": 200, "IsSuccess": True, "Data": data,
@@ -834,6 +839,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, {"count": HITS.get(want, 0)})
             if d.path == "/__debug/uploads":
                 return self.reply(200, UPLOADS)
+            if d.path == "/__debug/ignore-filter":
+                IGNORED_FILTERS.add(parse_qs(d.query).get("name", [""])[0])
+                return self.reply(200, sorted(IGNORED_FILTERS))
+            if d.path == "/__debug/honour-filters":
+                IGNORED_FILTERS.clear()
+                return self.reply(200, [])
             return self.reply(404, fail(404, "No debug route %s" % d.path))
         if not self.authorised():
             return
@@ -989,6 +1000,8 @@ class Handler(BaseHTTPRequestHandler):
                 return datetime.fromisoformat(raw.replace("Z", "+00:00")) if raw else None
 
             def ids(name):
+                if name in IGNORED_FILTERS:
+                    return None
                 raw = q.get(name, [None])[0]
                 return {x for x in raw.split(",") if x} if raw else None
 

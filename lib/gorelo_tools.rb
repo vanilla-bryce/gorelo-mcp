@@ -921,22 +921,50 @@ module GoreloTools
   # ignored), and hedged every reply about it. `filters` carries the other
   # documented names: ClientIds, UserIds, TicketIds.
   #
-  # The API still IGNORES names it does not recognise, so the window is
-  # re-checked locally on StartedOn. Rows from before it would mean the filter
-  # stopped being honoured; they are dropped and counted, never kept quietly.
-  # Returns [rows_in_window, rows_that_came_back_outside_it].
+  # The API still IGNORES names it does not recognise, so every filter that
+  # CAN be checked locally is: the window on StartedOn, UserIds on User.Id and
+  # TicketIds on Ticket.Id. A row that fails a check would mean that filter
+  # stopped being honoured; it is dropped and counted, never kept quietly.
+  #
+  # ClientIds CANNOT be checked here - an entry carries no client - so it is
+  # trusted. Checking it would need the ticket-to-client index, a whole extra
+  # sweep, on every call.
+  #
+  # Returns [kept_rows, stray] where stray maps each filter name to the number
+  # of rows dropped for failing it (see stray_note).
   def fetch_time_entries(api, since, filters = {})
     query = filters.merge('StartedSince' => since.utc.iso8601)
     rows  = api.get_all('/v1/time-entries', query)
-    stray = rows.count { |e| (at = entry_started_at(e)) && at < since }
-    [rows.reject { |e| (at = entry_started_at(e)) && at < since }, stray]
+    stray = Hash.new(0)
+
+    checks = { 'StartedSince' => ->(e) { (at = entry_started_at(e)).nil? || at >= since } }
+    { 'UserIds' => %w[User Id], 'TicketIds' => %w[Ticket Id] }.each do |name, path|
+      next if filters[name].nil? || filters[name].to_s.empty?
+
+      wanted = filters[name].to_s.split(',').map(&:strip).reject(&:empty?)
+      checks[name] = ->(e) { wanted.include?(nested(e, *path).to_s) }
+    end
+
+    kept = rows.select do |e|
+      failed = checks.find { |_, ok| !ok.call(e) }
+      stray[failed.first] += 1 if failed
+      failed.nil?
+    end
+    [kept, stray]
   end
 
+  # One warning line per filter the API did not honour, or nil when all held.
   def stray_note(stray)
-    return nil unless stray.positive?
-
-    "⚠ #{stray} entr(ies) from BEFORE the window came back despite StartedSince, and were " \
-      'dropped locally. The API may have stopped honouring the filter - check the spec.'
+    lines = stray.select { |_, n| n.positive? }.map do |name, n|
+      if name == 'StartedSince'
+        "⚠ #{n} entr(ies) from BEFORE the window came back despite StartedSince, and were " \
+          'dropped locally. The API may have stopped honouring the filter - check the spec.'
+      else
+        "⚠ #{n} entr(ies) came back that do not match #{name}, and were dropped locally. " \
+          "The API may have stopped honouring #{name} - check the spec."
+      end
+    end
+    lines.empty? ? nil : lines.join("\n")
   end
 
   def time_report(server, api)
@@ -1013,6 +1041,9 @@ module GoreloTools
         filters['ClientIds'] = matched.map { |c| c['Id'] }.join(',')
         scope << "client=#{matched.map { |c| c['Name'] }.first(3).join(' + ')}"
         if matched.size == 1
+          # Every entry is booked to this client on the strength of ClientIds
+          # alone. That filter cannot be re-checked locally (an entry carries
+          # no client), so it is trusted here - see fetch_time_entries.
           sole       = matched.first['Id']
           index_note = 'Filtered by the API with ClientIds; one client matched, so no lookup was needed.'
         elsif group_by == 'client'
@@ -1095,7 +1126,7 @@ module GoreloTools
              "#{included.size} included, across #{per_ticket.size} ticket(s). " \
              "#{api.requests - started} request(s) in total."
       out << 'The window was sent to the API as StartedSince.'
-      out << stray_note(stray) if stray.positive?
+      out << stray_note(stray) if stray_note(stray)
       out << index_note
       out << ''
       out << 'Per-person figures are EXACT: every hour is counted against the user named on its'
@@ -1818,7 +1849,7 @@ module GoreloTools
 
       out = ["#{rows.size} time entr(ies) - #{scope.join(', ')}."]
       out << format('%.2fh recorded, %.2fh to invoice, %.2fh billable.', act, adj, bill)
-      out << stray_note(stray) if stray.positive?
+      out << stray_note(stray) if stray_note(stray)
       out << ''
       out << "#{pad('Started', 17)}#{pad('User', 18)}#{pad('Ticket', 10)}#{'Rec'.rjust(7)}" \
              "#{'Adj'.rjust(7)}  #{pad('BillableStatus', 16)}#{pad('Work type', 18)}Billing role"
