@@ -578,6 +578,47 @@ INVOICES = [
 ]
 
 
+# --- item catalogue (Gorelo, 25 Sep 2026) ---------------------------------
+ITEM_CATEGORIES = [
+    {"Id": 1, "Name": "Managed Services", "Description": None, "TaxId": 1,
+     "Subcategories": [{"Id": 11, "Name": "Endpoints", "Description": None}]},
+    {"Id": 2, "Name": "Licensing", "Description": None, "TaxId": 1,
+     "Subcategories": [{"Id": 21, "Name": "Microsoft", "Description": None}]},
+    # Subcategory ids are issued independently of category ids, so 11 names a
+    # DIFFERENT subcategory here than under Managed Services.
+    {"Id": 3, "Name": "Hardware", "Description": None, "TaxId": None,
+     "Subcategories": [{"Id": 11, "Name": "Laptops", "Description": None}]},
+]
+
+
+def item(n, name, type_id, price, cost, cat=None, sub=None, sku=None, tax=1, status=1,
+         client=None, vendor=None):
+    return {"Id": "17e00000-0000-4000-8000-%012d" % n,
+            "Type": {"Id": type_id, "Name": "Product" if type_id == 1 else "Bundle"},
+            "Status": {"Id": status, "Name": "Active" if status == 1 else "Archived"},
+            "Name": name, "Number": None, "Description": None, "CategoryId": cat,
+            "SubcategoryId": sub, "ClientId": client, "LocationId": None, "Sku": sku,
+            "PartNumber": None, "Manufacturer": None, "Vendor": vendor, "UnitCost": cost,
+            "UnitPrice": price, "TaxId": tax, "ExternalProductId": None,
+            "CreatedOn": ago(200), "UpdatedOn": None}
+
+
+ITEMS = [
+    item(1, "Managed desktop seat", 1, 85.00, 30.00, 1, 11, "MDS-01"),
+    item(2, "Microsoft 365 Business Premium", 1, 36.30, 30.10, 2, 21, "M365-BP", vendor="Pax8"),
+    item(3, "Dell Latitude 5450", 1, 1899.00, 1520.00, 3, 11, "LAT-5450"),
+    item(4, "Legacy AV licence", 1, 5.00, 3.00, 2, None, "AV-OLD", status=2),
+    item(5, "DR test day", 1, 1200.00, 1350.00, None, None, "DR-DAY", tax=3, client=11002),
+    item(6, "New starter bundle", 2, 1900.00, 1550.10, 3, None, "NSB-01"),
+]
+ITEM_SUBITEMS = {ITEMS[5]["Id"]: [
+    {"ItemId": ITEMS[2]["Id"], "Name": "Dell Latitude 5450", "Quantity": 1,
+     "UnitCost": 1520.00, "UnitPrice": 1899.00},
+    {"ItemId": ITEMS[1]["Id"], "Name": "Microsoft 365 Business Premium", "Quantity": 1,
+     "UnitCost": 30.10, "UnitPrice": 36.30},
+]}
+
+
 POSTED = []
 
 
@@ -730,6 +771,37 @@ class Handler(BaseHTTPRequestHandler):
         # --- the 2026-09-04 release ------------------------------------
         # /v1/time-entries/statuses is a 404 on the real API. It is asserted
         # here so nobody invents it from the pattern of the other endpoints.
+        if path == "/v1/taxes":
+            return self.reply(200, env(TAXES))
+        if path == "/v1/items/categories":
+            return self.reply(200, env(ITEM_CATEGORIES))
+        m = re.fullmatch(r"/v1/items/([^/]+)", path)
+        if m:
+            hit = next((i for i in ITEMS if i["Id"] == m.group(1)), None)
+            if not hit:
+                return self.reply(404, fail(404, "Item not found"))
+            bundle = hit["Type"]["Id"] == 2
+            d = dict(hit, SubItems=ITEM_SUBITEMS.get(hit["Id"], []) if bundle else None,
+                     ShowSubItemsOnInvoice=True if bundle else None,
+                     ShowSubItemDescriptionsOnInvoice=False if bundle else None)
+            return self.reply(200, env(d))
+        if path == "/v1/items":
+            if page_too_big(q):
+                return self.reply(400, fail(400, "PageSize must be 1-200"))
+            rows = ITEMS
+            for name, key in (("TypeIds", lambda i: i["Type"]["Id"]),
+                              ("StatusIds", lambda i: i["Status"]["Id"]),
+                              ("CategoryIds", lambda i: i["CategoryId"]),
+                              ("ClientIds", lambda i: i["ClientId"])):
+                want = q_ids(q, name)
+                if want is not None:
+                    rows = [i for i in rows if str(key(i)) in want]
+            text = q.get("Query", [""])[0].lower()
+            if text:
+                rows = [i for i in rows
+                        if text in (i["Name"] + " " + (i["Description"] or "")).lower()]
+            rows, pag = paginate(rows, q)
+            return self.reply(200, env(rows, pag))
         if path == "/v1/time-entries/statuses":
             return self.reply(404, fail(404, "No route /v1/time-entries/statuses"))
 

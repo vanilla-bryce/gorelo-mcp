@@ -215,6 +215,40 @@ module Gorelo
       @cache[:contracts] ||= get_all('/v1/contracts')
     end
 
+    def taxes
+      @cache[:taxes] ||= Array(get('/v1/taxes')['Data'])
+    end
+
+    # "GST on Income 10%". A tax with SubTaxes charges the SUM of its
+    # components, and its own Percentage is not applied on top (spec, /v1/taxes).
+    def tax_label(tax_id)
+      return nil if tax_id.nil?
+
+      tax = taxes.find { |t| t['Id'].to_s == tax_id.to_s }
+      return "tax #{tax_id}" unless tax
+
+      subs = Array(tax['SubTaxes'])
+      pct  = subs.empty? ? tax['Percentage'] : subs.sum { |s| s['Percentage'].to_f }
+      pct.nil? ? tax['Name'] : "#{tax['Name']} #{format('%g', pct.to_f)}%"
+    end
+
+    def item_categories
+      @cache[:item_categories] ||= Array(get('/v1/items/categories')['Data'])
+    end
+
+    # Subcategory ids are issued independently of category ids, and one number
+    # can name a subcategory under two different categories - so a subcategory
+    # is only ever looked up INSIDE its own category.
+    def category_label(category_id, subcategory_id)
+      return nil if category_id.nil?
+
+      cat = item_categories.find { |c| c['Id'].to_s == category_id.to_s }
+      return "category #{category_id}" unless cat
+
+      sub = subcategory_id && Array(cat['Subcategories']).find { |s| s['Id'].to_s == subcategory_id.to_s }
+      sub ? "#{cat['Name']} › #{sub['Name']}" : cat['Name']
+    end
+
     def client_name(client_id)
       return nil if client_id.nil?
 

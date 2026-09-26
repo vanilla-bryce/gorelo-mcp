@@ -107,7 +107,7 @@ def run_suite():
 
     tools = s.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
     names = [t["name"] for t in tools]
-    check("19 tools advertised", len(tools) == 19, names)
+    check("20 tools advertised", len(tools) == 20, names)
     # There is deliberately no way to DELETE from this server. The strongest
     # form of that is structural: the client has no such method to call.
     lib = os.path.abspath(os.path.join(HERE, "..", "lib", "gorelo.rb"))
@@ -387,6 +387,32 @@ def run_suite():
           "Give the id" in amb and "Contract group" not in amb, amb)
     miss = s.call("gorelo_get_contract", contract="99999")
     check("an unknown id surfaces the 404", "404" in miss, miss)
+
+    print("\nitem catalogue")
+    it = s.call("gorelo_list_items")
+    check("active items only by default, filtered in the API",
+          "Legacy AV licence" not in it and "Managed desktop seat" in it
+          and last_query("/v1/items").get("StatusIds") == "1", it[:600])
+    lat = next((l for l in it.splitlines() if "Dell Latitude" in l), "")
+    check("a subcategory is looked up inside its own category",
+          "Hardware › Laptops" in lat and "Endpoints" not in lat, lat)
+    dr = next((l for l in it.splitlines() if "DR test day" in l), "")
+    check("a tax with components charges their sum", "HST 13%" in dr, dr)
+    check("an item priced below cost is flagged",
+          "SELLS BELOW COST" in it and "DR test day" in it.split("SELLS BELOW COST")[-1], it[-300:])
+    bun = s.call("gorelo_list_items", type="bundle")
+    check("a type filter is sent as TypeIds",
+          "New starter bundle" in bun and "Managed desktop seat" not in bun
+          and last_query("/v1/items").get("TypeIds") == "2", bun[:400])
+    one = s.call("gorelo_list_items", item="new starter bundle")
+    check("a bundle shows its parts and compares its price with them",
+          "Bundle contents (2)" in one and "Sum of parts" in one and "BELOW its parts" in one, one)
+    close = s.call("gorelo_list_items", item="Microsoft")
+    check("a partial name is refused with candidates, never guessed",
+          "is named exactly" in close and "Microsoft 365 Business Premium" in close, close)
+    arch = s.call("gorelo_list_items", status="archived")
+    check("archived items on request",
+          "Legacy AV licence" in arch and "Managed desktop seat" not in arch, arch[:400])
 
     print("\nresponse times")
     rr = s.call("gorelo_response_report", days=400, assignee="anyone", target_minutes=60)

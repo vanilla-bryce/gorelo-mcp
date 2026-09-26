@@ -27,11 +27,14 @@ module GoreloBillingTools
   STATUS_APPROVED = 5
   FLAG_LIST_MAX   = 25
   GUID = Gorelo::Client::GUID
+  ITEM_TYPE   = { 'product' => 1, 'bundle' => 2 }.freeze
+  ITEM_STATUS = { 'active' => 1, 'archived' => 2 }.freeze
 
   def register(server, api)
     list_invoices(server, api)
     get_invoice_pdf(server, api)
     get_contract(server, api)
+    list_items(server, api)
   end
 
   # ---- invoices -----------------------------------------------------------
@@ -351,6 +354,177 @@ module GoreloBillingTools
       unless flags.empty?
         out << ''
         flags.each { |f| out << "⚠ #{f}" }
+      end
+      out.join("\n")
+    end
+  end
+
+  # ---- item catalogue -----------------------------------------------------
+
+  def margin(price, cost)
+    return '-' if price.nil? || cost.nil? || price.to_f.zero?
+
+    format('%d%%', (((price.to_f - cost.to_f) / price.to_f) * 100).round)
+  end
+
+  # An item by UUID, or by its EXACT name (case-insensitive). A partial or
+  # repeated name is refused with the candidates: an invoice line must never
+  # land on a guessed product. Returns the DETAIL record (with SubItems).
+  def find_item(api, ref, active_only: false)
+    ref  = ref.to_s.strip
+    kind = active_only ? 'active item' : 'item'
+    return [nil, 'Give an item id or its exact name.'] if ref.empty?
+
+    if ref.match?(GUID)
+      row = api.get("/v1/items/#{ref}")['Data']
+      return [nil, "Item #{ref} (#{row['Name']}) is archived."] if active_only && nested(row, 'Status', 'Id') != 1
+
+      return [row, nil]
+    end
+
+    query = { 'Query' => ref[0, 200] }
+    query['StatusIds'] = ITEM_STATUS['active'] if active_only
+    rows  = api.get_all('/v1/items', query)
+    exact = rows.select { |i| i['Name'].to_s.strip.casecmp?(ref) }
+    return [api.get("/v1/items/#{exact.first['Id']}")['Data'], nil] if exact.size == 1
+    if exact.size > 1
+      return [nil, "#{exact.size} #{kind}s are named exactly #{ref.inspect}: " \
+                   "#{exact.map { |i| i['Id'] }.join(', ')}. Give the id."]
+    end
+    return [nil, "No #{kind} is named #{ref.inspect}."] if rows.empty?
+
+    [nil, "No #{kind} is named exactly #{ref.inspect}. Close: " \
+          "#{rows.first(8).map { |i| i['Name'] }.join(', ')}."]
+  end
+
+  def item_detail(api, ref)
+    i, why = find_item(api, ref)
+    return why unless i
+
+    cost  = i['UnitCost'].nil? ? '-' : money(i['UnitCost'])
+    price = i['UnitPrice'].nil? ? '-' : money(i['UnitPrice'])
+    out = ["#{i['Name']}  (#{nested(i, 'Type', 'Name')}, #{nested(i, 'Status', 'Name')})  id #{i['Id']}"]
+    out << "SKU #{i['Sku'] || '-'} · part #{i['PartNumber'] || '-'} · #{i['Manufacturer'] || '-'} · " \
+           "vendor #{i['Vendor'] || '-'}"
+    out << "Category: #{api.category_label(i['CategoryId'], i['SubcategoryId']) || '-'} · " \
+           "tax #{api.tax_label(i['TaxId']) || '-'}"
+    out << "Client: #{api.client_name(i['ClientId'])}" if i['ClientId']
+    out << "Unit cost #{cost} · unit price #{price} · margin #{margin(i['UnitPrice'], i['UnitCost'])}"
+    out << "Description: #{clip(i['Description'], 200)}" unless i['Description'].to_s.strip.empty?
+
+    subs = i['SubItems']
+    return out.join("\n") unless subs.is_a?(Array)
+
+    part_cost  = subs.sum { |s| s['Quantity'].to_f * s['UnitCost'].to_f }
+    part_price = subs.sum { |s| s['Quantity'].to_f * s['UnitPrice'].to_f }
+    out << ''
+    out << "Bundle contents (#{subs.size}):"
+    subs.each do |s|
+      out << "  #{format('%6.2f', s['Quantity'].to_f)} x #{pad(s['Name'], 34)}" \
+             "cost #{money(s['UnitCost']).rjust(9)}   price #{money(s['UnitPrice']).rjust(9)}"
+    end
+    out << "Sum of parts: cost #{money(part_cost)} · price #{money(part_price)}. " \
+           "Bundle: cost #{cost} (Gorelo derives it from the parts) · price #{price}."
+    if !i['UnitPrice'].nil? && part_price.positive?
+      diff = i['UnitPrice'].to_f - part_price
+      out << if diff.negative?
+               "The bundle sells #{money(-diff)} BELOW its parts bought separately."
+             else
+               "The bundle sells #{money(diff)} above its parts bought separately."
+             end
+    end
+    out << "Sub-items on the invoice: #{i['ShowSubItemsOnInvoice'] ? 'shown' : 'hidden'}; " \
+           "their descriptions: #{i['ShowSubItemDescriptionsOnInvoice'] ? 'shown' : 'hidden'}."
+    out.join("\n")
+  end
+
+  def list_items(server, api)
+    server.tool(
+      name:  'gorelo_list_items',
+      title: 'List the Gorelo product and bundle catalogue',
+      description: <<~TEXT,
+        The item catalogue: products and bundles with SKU, category, unit cost, unit price,
+        margin and tax. Give `item` for one item in full - for a bundle, its component products
+        and how the bundle's price compares with the sum of its parts.
+
+        This is where to find the item an invoice line needs: gorelo_create_draft_invoice takes
+        an item's id or exact name. Labour items are internal to contract pricing and never
+        appear here. Default: active items only. Items priced below cost are flagged.
+      TEXT
+      input_schema: {
+        type: 'object',
+        properties: {
+          query:    { type: 'string', description: 'Keyword matched against name and description.' },
+          type:     { type: 'string', enum: %w[all product bundle], description: 'Default "all".' },
+          category: { type: 'string', description: 'Category name fragment.' },
+          client:   { type: 'string', description: 'Client name fragment or id: items specific to that client.' },
+          status:   { type: 'string', enum: %w[active archived all], description: 'Default "active".' },
+          item:     { type: 'string', description: 'One item by id or exact name, shown in full.' },
+          limit:    { type: 'integer', description: 'Default 60.' }
+        },
+        additionalProperties: false
+      }
+    ) do |args|
+      next item_detail(api, args['item']) unless args['item'].to_s.strip.empty?
+
+      limit  = (args['limit'] || 60).to_i.clamp(1, 500)
+      status = (args['status'] || 'active').to_s.downcase
+      query  = { 'StatusIds' => ITEM_STATUS[status] }
+      scope  = [status]
+
+      type = args['type'].to_s.downcase
+      if ITEM_TYPE.key?(type)
+        query['TypeIds'] = ITEM_TYPE[type]
+        scope << "#{type}s"
+      end
+
+      unless args['query'].to_s.strip.empty?
+        query['Query'] = args['query'].to_s.strip[0, 200]
+        scope << "matching #{args['query'].to_s.strip.inspect}"
+      end
+
+      unless args['category'].to_s.strip.empty?
+        needle = args['category'].to_s.strip.downcase
+        cats = api.item_categories.select { |c| c['Name'].to_s.downcase.include?(needle) }
+        if cats.empty?
+          next "No category matches #{args['category'].inspect}. Categories: " \
+               "#{api.item_categories.map { |c| c['Name'] }.join(', ')}."
+        end
+        query['CategoryIds'] = cats.map { |c| c['Id'] }.join(',')
+        scope << "category=#{cats.map { |c| c['Name'] }.join(' + ')}"
+      end
+
+      unless args['client'].to_s.strip.empty?
+        matched = api.resolve_clients(args['client'])
+        next "No client matches #{args['client'].inspect}." if matched.empty?
+
+        query['ClientIds'] = matched.map { |c| c['Id'] }.join(',')
+        scope << "client=#{matched.map { |c| c['Name'] }.first(3).join(' + ')}"
+      end
+
+      rows = api.get_all('/v1/items', query)
+      next "No items - #{scope.join(', ')}." if rows.empty?
+
+      below = rows.select do |i|
+        !i['UnitCost'].nil? && !i['UnitPrice'].nil? && i['UnitPrice'].to_f < i['UnitCost'].to_f
+      end
+
+      out = ["#{rows.size} item(s) - #{scope.join(', ')}."]
+      out << ''
+      out << "#{pad('Name', 34)}#{pad('Type', 8)}#{pad('SKU', 12)}#{pad('Category', 26)}" \
+             "#{'Cost'.rjust(10)}#{'Price'.rjust(10)}#{'Margin'.rjust(8)}  Tax"
+      out << ('-' * 124)
+      rows.sort_by { |i| i['Name'].to_s.downcase }.first(limit).each do |i|
+        out << "#{pad(i['Name'], 34)}#{pad(nested(i, 'Type', 'Name'), 8)}#{pad(i['Sku'], 12)}" \
+               "#{pad(api.category_label(i['CategoryId'], i['SubcategoryId']) || '-', 26)}" \
+               "#{(i['UnitCost'].nil? ? '-' : money(i['UnitCost'])).rjust(10)}" \
+               "#{(i['UnitPrice'].nil? ? '-' : money(i['UnitPrice'])).rjust(10)}" \
+               "#{margin(i['UnitPrice'], i['UnitCost']).rjust(8)}  #{api.tax_label(i['TaxId']) || '-'}"
+      end
+      out << "#{rows.size - limit} more not shown - raise limit." if rows.size > limit
+      if below.any?
+        out << ''
+        out << "⚠ SELLS BELOW COST - #{below.size}: #{below.map { |i| i['Name'] }.first(12).join(', ')}"
       end
       out.join("\n")
     end
