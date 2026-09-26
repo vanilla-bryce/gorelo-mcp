@@ -413,6 +413,10 @@ def run_suite():
     arch = s.call("gorelo_list_items", status="archived")
     check("archived items on request",
           "Legacy AV licence" in arch and "Managed desktop seat" not in arch, arch[:400])
+    kit = s.call("gorelo_list_items", item="Site survey kit")
+    check("a bundle part with no price makes the sum unknown, never zero",
+          "unknown (1 part(s) have no price)" in kit and "unknown (1 part(s) have no cost)" in kit
+          and "BELOW its parts" not in kit and "above its parts" not in kit, kit)
 
     print("\nresponse times")
     rr = s.call("gorelo_response_report", days=400, assignee="anyone", target_minutes=60)

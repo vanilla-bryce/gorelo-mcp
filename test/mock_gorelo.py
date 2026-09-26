@@ -610,12 +610,18 @@ ITEMS = [
     item(4, "Legacy AV licence", 1, 5.00, 3.00, 2, None, "AV-OLD", status=2),
     item(5, "DR test day", 1, 1200.00, 1350.00, None, None, "DR-DAY", tax=3, client=11002),
     item(6, "New starter bundle", 2, 1900.00, 1550.10, 3, None, "NSB-01"),
+    item(7, "Site survey kit", 2, 450.00, None, 3, None, "SSK-01"),
 ]
 ITEM_SUBITEMS = {ITEMS[5]["Id"]: [
     {"ItemId": ITEMS[2]["Id"], "Name": "Dell Latitude 5450", "Quantity": 1,
      "UnitCost": 1520.00, "UnitPrice": 1899.00},
     {"ItemId": ITEMS[1]["Id"], "Name": "Microsoft 365 Business Premium", "Quantity": 1,
      "UnitCost": 30.10, "UnitPrice": 36.30},
+], ITEMS[6]["Id"]: [
+    {"ItemId": ITEMS[2]["Id"], "Name": "Dell Latitude 5450", "Quantity": 1,
+     "UnitCost": 1520.00, "UnitPrice": 1899.00},
+    {"ItemId": ITEMS[0]["Id"], "Name": "Survey labour pack", "Quantity": 1,
+     "UnitCost": None, "UnitPrice": None},
 ]}
 
 

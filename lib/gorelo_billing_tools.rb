@@ -415,17 +415,23 @@ module GoreloBillingTools
     subs = i['SubItems']
     return out.join("\n") unless subs.is_a?(Array)
 
-    part_cost  = subs.sum { |s| s['Quantity'].to_f * s['UnitCost'].to_f }
-    part_price = subs.sum { |s| s['Quantity'].to_f * s['UnitPrice'].to_f }
+    no_cost  = subs.select { |s| s['UnitCost'].nil? }
+    no_price = subs.select { |s| s['UnitPrice'].nil? }
+    part_cost  = subs.sum { |s| s['Quantity'].to_f * s['UnitCost'].to_f } if no_cost.empty?
+    part_price = subs.sum { |s| s['Quantity'].to_f * s['UnitPrice'].to_f } if no_price.empty?
     out << ''
     out << "Bundle contents (#{subs.size}):"
     subs.each do |s|
+      s_cost  = s['UnitCost'].nil?  ? '-' : money(s['UnitCost'])
+      s_price = s['UnitPrice'].nil? ? '-' : money(s['UnitPrice'])
       out << "  #{format('%6.2f', s['Quantity'].to_f)} x #{pad(s['Name'], 34)}" \
-             "cost #{money(s['UnitCost']).rjust(9)}   price #{money(s['UnitPrice']).rjust(9)}"
+             "cost #{s_cost.rjust(9)}   price #{s_price.rjust(9)}"
     end
-    out << "Sum of parts: cost #{money(part_cost)} · price #{money(part_price)}. " \
+    cost_sum  = no_cost.empty?  ? money(part_cost)  : "unknown (#{no_cost.size} part(s) have no cost)"
+    price_sum = no_price.empty? ? money(part_price) : "unknown (#{no_price.size} part(s) have no price)"
+    out << "Sum of parts: cost #{cost_sum} · price #{price_sum}. " \
            "Bundle: cost #{cost} (Gorelo derives it from the parts) · price #{price}."
-    if !i['UnitPrice'].nil? && part_price.positive?
+    if !i['UnitPrice'].nil? && no_price.empty? && part_price.positive?
       diff = i['UnitPrice'].to_f - part_price
       out << if diff.negative?
                "The bundle sells #{money(-diff)} BELOW its parts bought separately."
