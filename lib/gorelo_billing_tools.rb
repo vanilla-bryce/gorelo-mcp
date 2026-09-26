@@ -31,6 +31,7 @@ module GoreloBillingTools
   def register(server, api)
     list_invoices(server, api)
     get_invoice_pdf(server, api)
+    get_contract(server, api)
   end
 
   # ---- invoices -----------------------------------------------------------
@@ -228,6 +229,129 @@ module GoreloBillingTools
                "total #{money(row['Total'])}"
       end
       out << 'Gorelo has recorded this download as an export event on the invoice.'
+      out.join("\n")
+    end
+  end
+
+  # ---- contract detail ----------------------------------------------------
+
+  # A contract group by numeric id, or by a name fragment that matches exactly
+  # one. An ambiguous fragment is refused with the candidates.
+  def find_contract(api, ref)
+    ref = ref.to_s.strip
+    return [nil, 'Give a contract group id or a fragment of its name.'] if ref.empty?
+    return [ref.to_i, nil] if ref.match?(/\A\d+\z/)
+
+    needle = ref.downcase
+    hits = api.contracts.select { |c| c['Name'].to_s.downcase.include?(needle) }
+    return [nil, "No contract group name contains #{ref.inspect} (#{api.contracts.size} exist)."] if hits.empty?
+    if hits.size > 1
+      return [nil, "#{hits.size} contract groups match #{ref.inspect}: " \
+                   "#{hits.first(10).map { |c| "#{c['Id']} #{c['Name']}" }.join(', ')}. Give the id."]
+    end
+
+    [hits.first['Id'], nil]
+  end
+
+  def get_contract(server, api)
+    server.tool(
+      name:  'gorelo_get_contract',
+      title: 'Show one Gorelo contract group in full',
+      description: <<~TEXT,
+        Everything about one contract group: client, term, invoice schedule, contacts,
+        recurring amount/cost/margin, and each service line with its labour terms and the line
+        items it actually bills.
+
+        ⚠ THE TERMINOLOGY IS INVERTED. This is one /v1/contracts record, which Gorelo's web UI
+        calls a CONTRACT GROUP. Each service line under it is what the UI calls a CONTRACT.
+
+        Flagged: automatic approve-and-send (invoices go out with nobody reviewing them),
+        block-hours balances at or under their warning threshold, and service lines with no
+        line items.
+      TEXT
+      input_schema: {
+        type: 'object',
+        properties: {
+          contract: { type: 'string', description: 'Contract group id, or a fragment of its name.' }
+        },
+        required: ['contract'],
+        additionalProperties: false
+      }
+    ) do |args|
+      id, why = find_contract(api, args['contract'])
+      next why unless id
+
+      c     = api.get("/v1/contracts/#{id}")['Data']
+      flags = []
+      term  = [c['StartDate'], c['EndDate']].map { |d| d.to_s[0, 10] }
+      days  = c['DaysBeforeInvoiceCreation']
+
+      out = ["Contract group #{c['Id']} - #{c['Name']}"]
+      out << 'API "contract" = UI "Contract Group" (this record). ' \
+             'API "ServiceLine" = UI "Contract" (each line below).'
+      out << "Client: #{nested(c, 'Client', 'Name')} · #{nested(c, 'Status', 'Name')} · " \
+             "#{nested(c, 'RepeatPeriod', 'Name')} · #{term[0].empty? ? '?' : term[0]} → " \
+             "#{term[1].empty? ? 'open' : term[1]}" \
+             "#{c['Reference'].to_s.strip.empty? ? '' : " · ref #{c['Reference']}"}"
+      out << "Invoicing: created #{days.nil? ? '(not set)' : "#{days} day(s) before the period"} · " \
+             "InvoiceDue setting #{c['InvoiceDue'].inspect} · " \
+             "auto approve and send: #{c['AutoApproveAndSend'] ? 'YES' : 'no'}"
+      contacts = Array(c['Contacts']).map { |x| x['Name'] }
+      out << "Contacts: #{contacts.empty? ? '(none)' : contacts.join(', ')}"
+      out << "Recurring: bills #{money(c['RecurringAmount'])} · cost #{money(c['RecurringCost'])} · " \
+             "margin #{money(c['RecurringAmount'].to_f - c['RecurringCost'].to_f)} per period"
+      if c['AutoApproveAndSend']
+        flags << 'AUTO APPROVE AND SEND is on - invoices from this contract group are approved ' \
+                 'and emailed with nobody reviewing them.'
+      end
+
+      lines = Array(c['ServiceLines'])
+      flags << 'NO SERVICE LINES - an invoice container with nothing on it.' if lines.empty?
+      lines.each do |l|
+        detail = []
+        detail << "auto-approve #{l.dig('UnlimitedHoursDetails', 'AutoApprove') ? 'yes' : 'no'}" if l['UnlimitedHoursDetails']
+        %w[PerHourDetails LimitedHoursDetails].each do |k|
+          rate = nested(l, k, 'RateType', 'Name')
+          detail << "rate type #{rate}" if rate
+        end
+        if (b = l['BlockHoursDetails'])
+          warn_at = b['WarningThreshold']
+          detail << format('balance %.2fh · warn at %s · overrun at %s', b['Balance'].to_f,
+                           warn_at.nil? ? '-' : format('%.2fh', warn_at),
+                           b['OverrunThreshold'].nil? ? '-' : format('%.2fh', b['OverrunThreshold']))
+          if !warn_at.nil? && b['Balance'].to_f <= warn_at.to_f
+            flags << format('Block hours on "%s": balance %.2fh is at or under its warning threshold %.2fh.',
+                            l['Name'], b['Balance'].to_f, warn_at.to_f)
+          end
+        end
+
+        wt = Array(l['WorkTypes']).map { |x| x['Name'] }
+        wr = Array(l['WorkRoles']).map { |x| x['Name'] }
+        out << ''
+        out << "↳ Service line #{l['Id']} - #{l['Name']}  (UI: contract)"
+        out << "   Labour: #{([nested(l, 'LaborTerms', 'Name') || '(no labour terms)'] + detail).join(' · ')}"
+        out << "   Work types: #{wt.empty? ? '(any)' : wt.join(', ')} · roles: #{wr.empty? ? '(any)' : wr.join(', ')}"
+        out << "   Bills #{money(l['RecurringAmount'])} · cost #{money(l['RecurringCost'])} per period"
+
+        items = Array(l['LineItems'])
+        if items.empty?
+          flags << "NO LINE ITEMS on service line #{l['Id']} \"#{l['Name']}\" - it bills nothing yet."
+          next
+        end
+        out << "   #{'Qty'.rjust(7)}  #{pad('Item', 34)}#{'Unit'.rjust(10)}#{'Cost'.rjust(10)}" \
+               "#{'Amount'.rjust(11)}  #{pad('Tax', 18)}Billable"
+        items.each do |i|
+          out << "   #{format('%7.2f', i['Quantity'].to_f)}  #{pad(i['Name'], 34)}" \
+                 "#{money(i['UnitPrice']).rjust(10)}#{(i['Cost'].nil? ? '-' : money(i['Cost'])).rjust(10)}" \
+                 "#{money(i['Amount']).rjust(11)}  #{pad(nested(i, 'Tax', 'Name'), 18)}" \
+                 "#{nested(i, 'BillableStatus', 'Name')}"
+        end
+      end
+
+      unless flags.empty?
+        out << ''
+        flags.each { |f| out << "⚠ #{f}" }
+      end
       out.join("\n")
     end
   end

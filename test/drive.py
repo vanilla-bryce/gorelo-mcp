@@ -107,7 +107,7 @@ def run_suite():
 
     tools = s.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
     names = [t["name"] for t in tools]
-    check("18 tools advertised", len(tools) == 18, names)
+    check("19 tools advertised", len(tools) == 19, names)
     # There is deliberately no way to DELETE from this server. The strongest
     # form of that is structural: the client has no such method to call.
     lib = os.path.abspath(os.path.join(HERE, "..", "lib", "gorelo.rb"))
@@ -368,6 +368,25 @@ def run_suite():
           "No invoice numbered" in s.call("gorelo_get_invoice_pdf", invoice="INV-7777"))
     gone = s.call("gorelo_get_invoice_pdf", invoice="00000000-0000-4000-8000-000000000000")
     check("an unknown id surfaces Gorelo's 404, not an empty file", "404" in gone, gone)
+
+    print("\ncontract detail")
+    cd = s.call("gorelo_get_contract", contract="5001")
+    check("both vocabularies are printed",
+          'UI "Contract Group"' in cd and "(UI: contract)" in cd, cd[:400])
+    check("line items are listed per service line",
+          "Managed desktop seat" in cd and "3570.00" in cd, cd)
+    check("automatic approve-and-send is flagged", "AUTO APPROVE AND SEND" in cd, cd[-900:])
+    check("a block-hours balance at or under its warning threshold is flagged",
+          "at or under its warning threshold" in cd, cd[-900:])
+    check("a service line with no line items is flagged",
+          "NO LINE ITEMS on service line 9003" in cd, cd[-900:])
+    by_name = s.call("gorelo_get_contract", contract="contoso")
+    check("a unique name fragment resolves", "Contract group 5002" in by_name, by_name[:200])
+    amb = s.call("gorelo_get_contract", contract="a")
+    check("an ambiguous fragment lists candidates instead of guessing",
+          "Give the id" in amb and "Contract group" not in amb, amb)
+    miss = s.call("gorelo_get_contract", contract="99999")
+    check("an unknown id surfaces the 404", "404" in miss, miss)
 
     print("\nresponse times")
     rr = s.call("gorelo_response_report", days=400, assignee="anyone", target_minutes=60)

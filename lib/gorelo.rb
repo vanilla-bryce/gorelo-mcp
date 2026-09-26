@@ -211,6 +211,10 @@ module Gorelo
       @cache[:clients] ||= get_all('/v1/clients')
     end
 
+    def contracts
+      @cache[:contracts] ||= get_all('/v1/contracts')
+    end
+
     def client_name(client_id)
       return nil if client_id.nil?
 

@@ -488,6 +488,62 @@ COMMENTS = {
     ]
 }
 
+# --- taxes and contract detail (Gorelo, 25 Sep 2026) ----------------------
+TAXES = [
+    {"Id": 1, "Name": "GST on Income", "Code": "OUTPUT", "Percentage": 10.0,
+     "IsDefault": True, "SubTaxes": []},
+    {"Id": 2, "Name": "GST Free Income", "Code": "EXEMPTOUTPUT", "Percentage": 0.0,
+     "IsDefault": False, "SubTaxes": []},
+    # Components are what is charged; the parent's own Percentage is NOT added
+    # on top. It is null here, so only reading the components gives a rate.
+    {"Id": 3, "Name": "HST", "Code": "HST", "Percentage": None, "IsDefault": False,
+     "SubTaxes": [{"Id": 31, "Name": "GST", "Code": "G", "Percentage": 5.0},
+                  {"Id": 32, "Name": "PST", "Code": "P", "Percentage": 8.0}]},
+]
+
+
+def line_item(n, name, qty, price, cost, tax=None, billable=None):
+    tax = tax or TAXES[0]
+    return {"Id": n, "ItemId": None, "ItemType": {"Id": 1, "Name": "Product"},
+            "Name": name, "Description": None, "Quantity": qty, "Cost": cost,
+            "UnitPrice": price, "DiscountPercent": None, "StartDate": None, "EndDate": None,
+            "Tax": {"Id": tax["Id"], "Name": tax["Name"]}, "Amount": round(qty * price, 2),
+            "TaxAmount": None, "BillableStatus": billable or BILLABLE}
+
+
+def contract_detail(c):
+    d = {k: v for k, v in c.items() if k != "ClientId"}
+    d["Client"] = {"Id": c["ClientId"],
+                   "Name": next(x["Name"] for x in CLIENTS if x["Id"] == c["ClientId"])}
+    d.update({"IsForAllLocations": True, "DaysBeforeInvoiceCreation": 7, "InvoiceDue": 14,
+              "AutoApproveAndSend": False, "Contacts": []})
+    d["ServiceLines"] = [dict(l, LaborTerms={"Id": 5, "Name": "No labor terms"},
+                              WorkTypes=[], WorkRoles=[], UnlimitedHoursDetails=None,
+                              PerHourDetails=None, LimitedHoursDetails=None,
+                              BlockHoursDetails=None, RecurringAmount=0.0,
+                              RecurringCost=0.0, LineItems=[])
+                         for l in c["ServiceLines"]]
+    return d
+
+
+CONTRACT_DETAILS = {c["Id"]: contract_detail(c) for c in CONTRACTS}
+# Northwind: invoices go out unreviewed, one block-hours line is under its
+# warning threshold, and Backup Monitoring bills nothing. All three must flag.
+_nw = CONTRACT_DETAILS[5001]
+_nw["AutoApproveAndSend"] = True
+_nw["Contacts"] = [{"Id": 100000, "Name": "Dana Ellis"}]
+_desk, _srv, _bkp = _nw["ServiceLines"]
+_desk.update(LaborTerms={"Id": 1, "Name": "Unlimited Hours"},
+             UnlimitedHoursDetails={"AutoApprove": True},
+             WorkTypes=[{"Id": WORK_TYPES[0]["Id"], "Name": WORK_TYPES[0]["Name"]}],
+             RecurringAmount=3570.0, RecurringCost=1260.0,
+             LineItems=[line_item(1, "Managed desktop seat", 42, 85.0, 30.0)])
+_srv.update(LaborTerms={"Id": 3, "Name": "Block Hours"},
+            BlockHoursDetails={"Balance": 3.5, "WarningThreshold": 5.0, "OverrunThreshold": 0.0},
+            RecurringAmount=1280.0, RecurringCost=840.0,
+            LineItems=[line_item(2, "Managed server", 4, 320.0, 210.0)])
+
+
 # --- invoices (Gorelo, 25 Sep 2026) ---------------------------------------
 def day(d):
     """A calendar date d days ago (negative for the future), as the API sends it."""
@@ -755,6 +811,13 @@ class Handler(BaseHTTPRequestHandler):
                 rows = [e for e in rows if e["Ticket"] and e["Ticket"]["Id"] in tickets]
             rows, pag = paginate(rows, q)
             return self.reply(200, env(rows, pag))
+
+        m = re.fullmatch(r"/v1/contracts/(\d+)", path)
+        if m:
+            hit = CONTRACT_DETAILS.get(int(m.group(1)))
+            if not hit:
+                return self.reply(404, fail(404, "Contract not found"))
+            return self.reply(200, env(hit))
 
         if path == "/v1/contracts":
             rows, pag = paginate(CONTRACTS, q)
