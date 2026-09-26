@@ -689,7 +689,27 @@ def run_suite():
     check("and a repeat after a timeout is refused", "Refused" in
           s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
                   reference="SLOW-POST", confirm=True))
+    h0 = hits(P)
+    drop = s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
+                   reference="DROP-POST", confirm=True)
+    check("a POST whose connection drops with no reply MAY have been created, and is not retried",
+          "MAY have been created" in drop and "Nothing was created" not in drop
+          and hits(P) == h0 + 1, (drop, h0, hits(P)))
+    check("and a repeat after a dropped connection is refused", "Refused" in
+          s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
+                  reference="DROP-POST", confirm=True))
+    h0 = hits(P)
+    garble = s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
+                     reference="GARBLE-POST", confirm=True)
+    check("a 2xx POST whose reply cannot be read MAY have been created, never 'nothing was created'",
+          "MAY have been created" in garble and "Nothing was created" not in garble
+          and hits(P) == h0 + 1, garble)
     CP = "/v1/tickets/00000000-0000-0000-0000-000000001000/comments"
+    h0 = hits(CP)
+    dropc = s2.call("gorelo_add_ticket_comment", ticket="G-1000", body="DROP-POST comment",
+                    confirm=True)
+    check("a comment whose connection drops with no reply MAY have been posted",
+          hits(CP) == h0 + 1 and "MAY have been posted" in dropc, dropc)
     h0 = hits(CP)
     maybe = s2.call("gorelo_add_ticket_comment", ticket="G-1000", body="BOOM-500 comment",
                     confirm=True)

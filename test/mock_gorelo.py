@@ -36,6 +36,7 @@ import json
 import base64
 import email.policy
 import re
+import socket
 import sys
 import time
 import uuid
@@ -742,6 +743,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def drop(self):
+        """Close the connection without sending any response: the request was
+        read in full (and acted on), but the client gets EOF, not a status."""
+        self.close_connection = True
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
     def authorised(self):
         if self.headers.get("X-API-Key") != KEY:
             self.reply(401, fail(401, "Invalid API key"))
@@ -1130,6 +1140,8 @@ class Handler(BaseHTTPRequestHandler):
             # retry would post it twice.
             if "BOOM-500" in body.get("Body", ""):
                 return self.reply(500, fail(500, "Internal server error"))
+            if "DROP-POST" in body.get("Body", ""):
+                return self.drop()
             return self.reply(200, env({"Id": "new-comment"}))
         self.reply(404, fail(404, "No such write path"))
 
@@ -1223,6 +1235,20 @@ class Handler(BaseHTTPRequestHandler):
         # ambiguous as a 5xx, and must not be retried either.
         if body.get("Reference") == "SLOW-POST":
             time.sleep(5)
+        # DROP-POST: the invoice IS created, then the connection is closed with
+        # no reply at all - the client sees EOF, not an HTTP status.
+        if body.get("Reference") == "DROP-POST":
+            return self.drop()
+        # GARBLE-POST: the invoice IS created, then a 200 arrives whose body is
+        # not JSON - accepted, but with no readable id.
+        if body.get("Reference") == "GARBLE-POST":
+            raw = b"<html>OK</html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         return self.reply(200, env({"Id": INVOICES[-1]["Id"]}))
 
 

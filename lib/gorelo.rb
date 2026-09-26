@@ -21,6 +21,7 @@
 #     word without the other.
 
 require 'net/http'
+require 'openssl'
 require 'uri'
 require 'json'
 require 'digest'
@@ -33,10 +34,27 @@ module Gorelo
   class AuthError < Error; end
   class WritesDisabled < Error; end
 
-  # A POST that failed with a server error. It MAY have been applied - a 5xx
-  # says nothing either way - so it is never retried: retrying a POST that did
-  # land raises a second invoice or posts a second comment.
+  # A POST whose outcome is unknown: a 5xx, a read timeout, a connection
+  # dropped or reset after the body went out, or a 2xx whose reply could not be
+  # read. It MAY have been applied, so it is never retried: retrying a POST that
+  # did land raises a second invoice or posts a second comment.
   class AmbiguousWrite < Error; end
+
+  # A non-2xx reply that Gorelo actually sent, carrying its status. A 4xx means
+  # Gorelo refused the request; callers may rely on that to say "not applied".
+  class HttpError < Error
+    attr_reader :status
+
+    def initialize(message, status:)
+      super(message)
+      @status = status
+    end
+  end
+
+  # Transport failures that can happen AFTER a request body went out. On a POST
+  # each one leaves the outcome unknown. (OpenTimeout and SocketError cannot:
+  # they happen before anything is sent.)
+  TRANSPORT_ERRORS = [IOError, SystemCallError, OpenSSL::SSL::SSLError, Net::WriteTimeout].freeze
 
   # A failure that waiting might fix: rate limits and server faults.
   class RetryableError < Error
@@ -417,7 +435,8 @@ module Gorelo
       http.open_timeout = 15
       http.read_timeout = READ_TIMEOUT
 
-      with_retry(path) { handle(http.request(req), uri, raw: raw, retry_5xx: klass != Net::HTTP::Post) }
+      post = klass == Net::HTTP::Post
+      with_retry(path) { handle(http.request(req), uri, raw: raw, retry_5xx: !post, post: post) }
     rescue Net::ReadTimeout => e
       # Nothing was sent yet on an OpenTimeout, but a ReadTimeout on a POST
       # happens AFTER the body went out - Gorelo may have applied it. Exactly
@@ -428,6 +447,19 @@ module Gorelo
                               'Check Gorelo before trying again.'
       end
       raise Error, "Gorelo timed out calling #{path}: #{e.class}"
+    rescue Errno::ECONNREFUSED => e
+      # Refused at connect: nothing was sent, so nothing can have been applied.
+      raise Error, "Cannot reach #{@base_url}: #{e.message}"
+    rescue *TRANSPORT_ERRORS => e
+      # EOFError, ECONNRESET, EPIPE, an SSL failure or a write timeout: the
+      # connection broke mid-exchange. On a POST the body may already have been
+      # received and acted on, so this is exactly as ambiguous as a timeout.
+      if klass == Net::HTTP::Post
+        raise AmbiguousWrite, "The connection to Gorelo failed during #{path} (#{e.class}: #{e.message}).\n  " \
+                              'Not retried: this was a POST, and the request may have been applied. ' \
+                              'Check Gorelo before trying again.'
+      end
+      raise Error, "The connection to Gorelo failed calling #{path}: #{e.class}: #{e.message}"
     rescue Net::OpenTimeout => e
       raise Error, "Gorelo timed out calling #{path}: #{e.class}"
     rescue SocketError => e
@@ -453,7 +485,7 @@ module Gorelo
       end
     end
 
-    def handle(res, uri, raw: false, retry_5xx: true)
+    def handle(res, uri, raw: false, retry_5xx: true, post: false)
       code = res.code.to_i
 
       # Auth failures must always surface plainly. Reporting them as "no data"
@@ -500,9 +532,10 @@ module Gorelo
         # GET /v1/time-entries returns every entry. A 405 tells you about ONE
         # path and one verb, never about a feature.
         if code == 405
-          raise Error, "#{message}\n  405 means this PATH EXISTS but does not accept GET - " \
-                       "it is defined for another verb (POST, PATCH or DELETE).\n  This server " \
-                       'only ever issues GET, so the endpoint is real but not readable from here.'
+          raise HttpError.new("#{message}\n  405 means this PATH EXISTS but does not accept GET - " \
+                              "it is defined for another verb (POST, PATCH or DELETE).\n  This server " \
+                              'only ever issues GET, so the endpoint is real but not readable from here.',
+                              status: 405)
         end
 
         # A 429 was never processed, so it is always safe to retry. A 5xx on a
@@ -517,10 +550,19 @@ module Gorelo
                                             retry_after: retry_after_seconds(res, parsed))
         end
 
-        raise Error, message
+        raise HttpError.new(message, status: code)
       end
 
-      raise Error, "Gorelo returned a non-JSON body for #{uri.path}" if parsed.nil?
+      if parsed.nil?
+        # Gorelo accepted the POST (2xx) and then said something unreadable: it
+        # was very probably applied, and there is no id to prove it either way.
+        if post
+          raise AmbiguousWrite, "Gorelo accepted #{uri.path} (HTTP #{code}) but its reply was not JSON, " \
+                                "so the result is unknown.\n  Not retried: this was a POST, and the " \
+                                'request was probably applied. Check Gorelo before trying again.'
+        end
+        raise Error, "Gorelo returned a non-JSON body for #{uri.path}"
+      end
 
       if parsed.key?('IsSuccess') && parsed['IsSuccess'] == false
         raise Error, "Gorelo reported failure for #{uri.path}: #{summarise_notifications(parsed)}"
