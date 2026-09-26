@@ -107,7 +107,7 @@ def run_suite():
 
     tools = s.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
     names = [t["name"] for t in tools]
-    check("20 tools advertised", len(tools) == 20, names)
+    check("21 tools advertised", len(tools) == 21, names)
     # There is deliberately no way to DELETE from this server. The strongest
     # form of that is structural: the client has no such method to call.
     lib = os.path.abspath(os.path.join(HERE, "..", "lib", "gorelo.rb"))
@@ -417,6 +417,25 @@ def run_suite():
     check("a bundle part with no price makes the sum unknown, never zero",
           "unknown (1 part(s) have no price)" in kit and "unknown (1 part(s) have no cost)" in kit
           and "BELOW its parts" not in kit and "above its parts" not in kit, kit)
+
+    print("\nuptime checks")
+    up = s.call("gorelo_list_uptime")
+    check("every check is listed with its target",
+          "203.0.113.10" in up and "198.51.100.7:443" in up
+          and "https://portal.contoso.example" in up, up[:900])
+    check("a window with no duration never expires, and is flagged",
+          "NEVER EXPIRES" in up and "Fabrikam - VPN: in maintenance with NO END" in up, up[-900:])
+    check("a window running more than 7 days is flagged",
+          "Tailspin - website: in maintenance since" in up, up[-900:])
+    check("a short current window is not flagged",
+          "Contoso - client portal:" not in up.split("⚠", 1)[-1], up[-900:])
+    only = s.call("gorelo_list_uptime", maintenance="only")
+    check("maintenance=only keeps only silenced checks",
+          "Northwind - head office ping" not in only and "3 uptime check(s)" in only, only[:600])
+    ce = s.call("gorelo_list_uptime", client="Contoso")
+    check("a client filter is sent as ClientIds",
+          "Contoso - client portal" in ce and "Tailspin" not in ce
+          and last_query("/v1/uptime").get("ClientIds") == "11002", ce[:500])
 
     print("\nresponse times")
     rr = s.call("gorelo_response_report", days=400, assignee="anyone", target_minutes=60)

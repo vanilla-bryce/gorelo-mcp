@@ -625,6 +625,42 @@ ITEM_SUBITEMS = {ITEMS[5]["Id"]: [
 ]}
 
 
+# --- uptime checks (Gorelo, 25 Sep 2026) ----------------------------------
+UPTIME_TYPES = {1: "ICMP", 2: "HTTP", 3: "TCP"}
+NO_WINDOW = {"Enabled": False, "StartDateTime": None, "DurationInMinutes": None, "Reason": None}
+
+
+def window(days_ago, minutes, reason, hours_ago=0):
+    return {"Enabled": True, "StartDateTime": ago(days_ago, hours_ago),
+            "DurationInMinutes": minutes, "Reason": reason}
+
+
+def uptime(n, desc, type_id, client, status, target, maint=None, created=100):
+    return {"Id": "0b700000-0000-4000-8000-%012d" % n, "Description": desc,
+            "Type": {"Id": type_id, "Name": UPTIME_TYPES[type_id]},
+            "Target": dict({"Ip": None, "Port": None, "Url": None}, **target),
+            "AdoptClientAssets": False, "ClientId": client, "LocationId": None,
+            "Status": {"Id": 1 if status == "Up" else 2, "Name": status},
+            "Frequency": 60, "NumberOfRetriesAfterFailure": 2, "RegionId": 1,
+            "IspConnectionLink": None, "TagIds": [],
+            "MaintenanceMode": dict(maint or NO_WINDOW),
+            "CreatedOn": ago(created), "UpdatedOn": None}
+
+
+UPTIME = [
+    uptime(1, "Northwind - head office ping", 1, 11001, "Up", {"Ip": "203.0.113.10"}, created=10),
+    uptime(2, "Contoso - client portal", 2, 11002, "Down",
+           {"Url": "https://portal.contoso.example"},
+           window(0, 240, "Portal migration", hours_ago=2), created=20),
+    # Duration 0: the window never ends, and has been silencing alerts for 30 days.
+    uptime(3, "Fabrikam - VPN", 3, 11003, "Up", {"Ip": "198.51.100.7", "Port": 443},
+           window(30, 0, "Firewall replacement"), created=30),
+    # A two-week window, nine days in.
+    uptime(4, "Tailspin - website", 2, 11004, "Up", {"Url": "https://tailspin.example"},
+           window(9, 20160, "Site rebuild"), created=40),
+]
+
+
 POSTED = []
 
 
@@ -806,6 +842,27 @@ class Handler(BaseHTTPRequestHandler):
             if text:
                 rows = [i for i in rows
                         if text in (i["Name"] + " " + (i["Description"] or "")).lower()]
+            rows, pag = paginate(rows, q)
+            return self.reply(200, env(rows, pag))
+        m = re.fullmatch(r"/v1/uptime/([^/]+)", path)
+        if m:
+            hit = next((c for c in UPTIME if c["Id"] == m.group(1)), None)
+            if not hit:
+                return self.reply(404, fail(404, "Uptime check not found"))
+            return self.reply(200, env(hit))
+        if path == "/v1/uptime":
+            if page_too_big(q):
+                return self.reply(400, fail(400, "PageSize must be 1-200"))
+            rows = UPTIME
+            for name, key in (("ClientIds", lambda c: c["ClientId"]),
+                              ("TypeIds", lambda c: c["Type"]["Id"])):
+                want = q_ids(q, name)
+                if want is not None:
+                    rows = [c for c in rows if str(key(c)) in want]
+            text = q.get("Query", [""])[0].lower()
+            if text:
+                rows = [c for c in rows if text in (c["Description"] or "").lower()]
+            rows = sorted(rows, key=lambda c: c["CreatedOn"], reverse=True)
             rows, pag = paginate(rows, q)
             return self.reply(200, env(rows, pag))
         if path == "/v1/time-entries/statuses":

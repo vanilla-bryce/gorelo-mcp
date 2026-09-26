@@ -18,6 +18,7 @@ require_relative 'lib/mcp_server'
 require_relative 'lib/gorelo'
 require_relative 'lib/gorelo_tools'
 require_relative 'lib/gorelo_billing_tools'
+require_relative 'lib/gorelo_uptime_tools'
 
 VERSION = '1.0.0'
 
@@ -84,4 +85,5 @@ server.log("base_url=#{api.base_url} writes=#{api.writes_allowed? ? 'ENABLED' : 
 
 GoreloTools.register(server, api)
 GoreloBillingTools.register(server, api)
+GoreloUptimeTools.register(server, api)
 server.run
