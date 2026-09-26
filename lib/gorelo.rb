@@ -70,6 +70,8 @@ module Gorelo
     # Gorelo clamps PageSize to 1..200. Overridable so pagination can be
     # exercised against a small dataset without waiting for a big one.
     PAGE_SIZE = (ENV['GORELO_PAGE_SIZE'] || 200).to_i.clamp(1, 200)
+    # Overridable so the test suite can force a read timeout without waiting a minute.
+    READ_TIMEOUT = (ENV['GORELO_READ_TIMEOUT'] || 60).to_i.clamp(1, 300)
 
     attr_reader :base_url
 
@@ -391,10 +393,20 @@ module Gorelo
       http = Net::HTTP.new(uri.host, uri.port)
       http.use_ssl      = uri.scheme == 'https'
       http.open_timeout = 15
-      http.read_timeout = 60
+      http.read_timeout = READ_TIMEOUT
 
       with_retry(path) { handle(http.request(req), uri, raw: raw, retry_5xx: klass != Net::HTTP::Post) }
-    rescue Net::OpenTimeout, Net::ReadTimeout => e
+    rescue Net::ReadTimeout => e
+      # Nothing was sent yet on an OpenTimeout, but a ReadTimeout on a POST
+      # happens AFTER the body went out - Gorelo may have applied it. Exactly
+      # as ambiguous as a 5xx, so it is never retried either.
+      if klass == Net::HTTP::Post
+        raise AmbiguousWrite, "Gorelo timed out waiting for a reply to #{path} (#{e.class}).\n  " \
+                              'Not retried: this was a POST, and the request may have been applied. ' \
+                              'Check Gorelo before trying again.'
+      end
+      raise Error, "Gorelo timed out calling #{path}: #{e.class}"
+    rescue Net::OpenTimeout => e
       raise Error, "Gorelo timed out calling #{path}: #{e.class}"
     rescue SocketError => e
       raise Error, "Cannot reach #{@base_url}: #{e.message}"

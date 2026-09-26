@@ -36,6 +36,7 @@ import json
 import base64
 import re
 import sys
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1170,6 +1171,11 @@ class Handler(BaseHTTPRequestHandler):
         # where retrying the POST raises a second invoice.
         if body.get("Reference") == "BOOM-500":
             return self.reply(500, fail(500, "Internal server error"))
+        # SLOW-POST: the invoice IS created, then the reply is delayed past the
+        # client's read timeout - a read timeout on a POST is exactly as
+        # ambiguous as a 5xx, and must not be retried either.
+        if body.get("Reference") == "SLOW-POST":
+            time.sleep(5)
         return self.reply(200, env({"Id": INVOICES[-1]["Id"]}))
 
 

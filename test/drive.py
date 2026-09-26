@@ -32,6 +32,7 @@ ENV.update({
     "GORELO_BASE_URL": "http://127.0.0.1:8899",
     "GORELO_MY_EMAIL": "sam@example.com",
     "GORELO_ALLOW_WRITES": os.environ.get("WRITES", "false"),
+    "GORELO_READ_TIMEOUT": "3",
     "HOME": os.path.join(HERE, "_tmp_home"),
     "GORELO_DOWNLOAD_DIR": os.path.join(HERE, "_tmp_home", "downloads"),
 })
@@ -673,6 +674,15 @@ def run_suite():
     check("and a repeat is refused", "Refused" in
           s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
                   reference="BOOM-500", confirm=True))
+    h0 = hits(P)
+    slow = s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
+                   reference="SLOW-POST", confirm=True)
+    check("a POST that times out is treated as MAY-exist, not 'nothing was created'",
+          "MAY have been created" in slow and "Nothing was created" not in slow
+          and hits(P) == h0 + 1, slow)
+    check("and a repeat after a timeout is refused", "Refused" in
+          s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
+                  reference="SLOW-POST", confirm=True))
     CP = "/v1/tickets/00000000-0000-0000-0000-000000001000/comments"
     h0 = hits(CP)
     maybe = s2.call("gorelo_add_ticket_comment", ticket="G-1000", body="BOOM-500 comment",
