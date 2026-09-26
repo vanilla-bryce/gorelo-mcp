@@ -34,10 +34,12 @@ Run it:  python3 mock_gorelo.py        (listens on 127.0.0.1:8899)
 """
 import json
 import base64
+import email.policy
 import re
 import sys
 import time
 import uuid
+from email.parser import BytesParser
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -58,6 +60,10 @@ LAST_BODY = {}
 
 # How many POSTs each path has received - proves a failed POST was not retried.
 HITS = {}
+
+# Every file uploaded to /v1/attachments, and every URL handed back for one.
+UPLOADS = []
+ISSUED_URLS = set()
 
 
 def ago(days, hours=0):
@@ -812,6 +818,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, LAST_BODY.get(want, {}))
             if d.path == "/__debug/hits":
                 return self.reply(200, {"count": HITS.get(want, 0)})
+            if d.path == "/__debug/uploads":
+                return self.reply(200, UPLOADS)
             return self.reply(404, fail(404, "No debug route %s" % d.path))
         if not self.authorised():
             return
@@ -1092,7 +1100,10 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         HITS[u.path] = HITS.get(u.path, 0) + 1
         length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length) or b"{}")
+        raw = self.rfile.read(length)
+        if u.path == "/v1/attachments":
+            return self.post_attachment(raw)
+        body = json.loads(raw or b"{}")
         LAST_BODY[u.path] = body
         if u.path == "/v1/invoices":
             return self.post_invoice(body)
@@ -1108,6 +1119,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(400, fail(400, "Unknown fields: %s" % sorted(unknown)))
             if body.get("ConversationTypeId") in (1, 2) and "ConversationId" in body:
                 return self.reply(400, fail(400, "ConversationId rejected for Public/Private"))
+            for a in body.get("Attachments") or []:
+                if set(a) != {"Name", "Url"} or a["Url"] not in ISSUED_URLS:
+                    return self.reply(400, fail(400, "Attachment not uploaded here: %s" % a))
             POSTED.append({"ticket": m.group(1), "body": body})
             sys.stderr.write("POSTED to %s ConversationTypeId=%s\n"
                              % (m.group(1), body.get("ConversationTypeId")))
@@ -1118,6 +1132,34 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(500, fail(500, "Internal server error"))
             return self.reply(200, env({"Id": "new-comment"}))
         self.reply(404, fail(404, "No such write path"))
+
+    def post_attachment(self, raw):
+        ctype = self.headers.get("Content-Type", "")
+        if not ctype.startswith("multipart/form-data"):
+            return self.reply(415, fail(415, "multipart/form-data required"))
+        msg = BytesParser(policy=email.policy.default).parsebytes(
+            b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + raw)
+        fields, upload = {}, None
+        for part in msg.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            data = part.get_payload(decode=True) or b""
+            if part.get_filename() is not None:
+                if name != "file":
+                    return self.reply(400, fail(400, "The file part must be named 'file'"))
+                upload = (part.get_filename(), data)
+            else:
+                fields[name] = data.decode()
+        if upload is None:
+            return self.reply(400, fail(400, "No file part"))
+        if fields.get("itemType") not in ("Ticket", "Task", "Project"):
+            return self.reply(400, fail(400, "itemType must be Ticket, Task or Project"))
+        if fields["itemType"] == "Ticket" and not any(t["Id"] == fields.get("itemId") for t in TICKETS):
+            return self.reply(404, fail(404, "Ticket not found"))
+        url = "https://files.example.invalid/%s?token=t0k3n" % uuid.uuid4()
+        ISSUED_URLS.add(url)
+        UPLOADS.append({"itemType": fields["itemType"], "itemId": fields.get("itemId"),
+                        "name": upload[0], "size": len(upload[1])})
+        return self.reply(200, env({"Name": upload[0], "Url": url}))
 
     INVOICE_FIELDS = {"ClientId", "StatusId", "InvoiceDate", "DueDate", "Reference",
                       "RecipientEmails", "LineItems"}

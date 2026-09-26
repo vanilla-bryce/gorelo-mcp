@@ -15,6 +15,7 @@
 require 'time'
 require 'set'
 require 'json'
+require 'digest'
 require_relative 'gorelo'
 
 module GoreloTools
@@ -1349,12 +1350,49 @@ module GoreloTools
            .join
   end
 
+  ATTACH_MAX_BYTES = 44 * 1024 * 1024 # Gorelo's documented upload limit
+
+  def attach_dir = File.expand_path(ENV['GORELO_ATTACH_DIR'] || '~/gorelo-attachments')
+
+  # Only files a person deliberately put in GORELO_ATTACH_DIR can be attached.
+  # Ticket text is untrusted input the assistant reads; without this, a crafted
+  # ticket could talk it into attaching ~/.ssh/id_rsa or this project's .env to
+  # a comment. realpath resolves `..`, `~` and symlinks BEFORE the containment
+  # check, so none of them can step outside. Returns [path, nil] or [nil, why].
+  def attachment_path(name)
+    root = begin
+      File.realpath(attach_dir)
+    rescue SystemCallError
+      return [nil, "the attachment folder #{attach_dir} does not exist - create it and put the file there"]
+    end
+    real = begin
+      File.realpath(File.expand_path(name.to_s, root))
+    rescue SystemCallError
+      return [nil, "#{name}: no such file in #{root}"]
+    end
+    return [nil, "#{name}: outside #{root} - only files in that folder can be attached"] unless real.start_with?("#{root}/")
+    return [nil, "#{name}: not a regular file"] unless File.file?(real)
+
+    size = File.size(real)
+    return [nil, "#{name}: the file is empty"] if size.zero?
+    return [nil, "#{name}: #{(size / 1_048_576.0).round(1)} MB is over Gorelo's 44 MB limit"] if size > ATTACH_MAX_BYTES
+
+    [real, nil]
+  end
+
+  def orphans(uploaded)
+    return '' if uploaded.empty?
+
+    "\n⚠ Already uploaded to the ticket and now referenced by nothing (the API has no way to " \
+      "remove them): #{uploaded.map { |u| u['Name'] }.join(', ')}."
+  end
+
   def add_ticket_comment(server, api)
     server.tool(
       name:  'gorelo_add_ticket_comment',
       title: 'Add a comment to a Gorelo ticket',
       description: <<~TEXT,
-        Post a comment on a ticket. This is the ONLY tool that writes anything.
+        Post a comment on a ticket, optionally with files attached.
 
         Safety:
           - disabled unless GORELO_ALLOW_WRITES=true
@@ -1363,6 +1401,8 @@ module GoreloTools
             is set to "client", which sends 1 (Public) and may email the client
           - identical comments on the same ticket within 24 hours are refused, so a
             retried call cannot post twice
+          - files are attached ONLY from GORELO_ATTACH_DIR (default ~/gorelo-attachments),
+            max 44 MB each, and every file is checked before anything is uploaded
       TEXT
       read_only: false,
       input_schema: {
@@ -1372,6 +1412,8 @@ module GoreloTools
           body:       { type: 'string', description: 'The comment text. Sent as HTML; plain text is converted.' },
           visibility: { type: 'string', enum: %w[internal client], description: 'Default "internal" (ConversationTypeId 2). "client" posts publicly (1).' },
           author:     { type: 'string', description: 'Optional display name for the comment author.' },
+          files:      { type: 'array', items: { type: 'string' }, maxItems: 10,
+                        description: 'Optional. Names of files in GORELO_ATTACH_DIR (default ~/gorelo-attachments) to attach. Nothing outside that folder can be attached.' },
           confirm:    { type: 'boolean', description: 'Must be true. A deliberate speed bump on the only write path.' }
         },
         required: %w[ticket body confirm],
@@ -1389,13 +1431,34 @@ module GoreloTools
       t = find_ticket(api, args['ticket'])
       next "Could not find ticket #{args['ticket']} - nothing was posted." unless t
 
-      key = api.fingerprint(t['Id'], args['body'].strip, type_id)
+      checked  = Array(args['files']).map { |f| attachment_path(f) }
+      problems = checked.filter_map { |_, why| why }
+      next "Refused - nothing was posted or uploaded:\n  #{problems.join("\n  ")}" unless problems.empty?
+
+      paths = checked.map(&:first)
+      # With no files this is the same fingerprint as before, so the 24-hour
+      # duplicate guard carries on across the upgrade.
+      key = api.fingerprint(t['Id'], args['body'].strip, type_id,
+                            *paths.map { |p| Digest::SHA256.file(p).hexdigest })
       if api.write_fingerprint_seen?(key)
         next "Refused: an identical comment was already posted to #{t['DisplayNumber']} in the " \
              'last 24 hours. Nothing was sent.'
       end
 
+      # Uploads first: the comment references what they return.
+      uploaded = []
+      failure  = nil
+      paths.each do |p|
+        d = api.post_multipart('/v1/attachments', { 'itemType' => 'Ticket', 'itemId' => t['Id'] }, p)['Data']
+        uploaded << { 'Name' => d['Name'], 'Url' => d['Url'] }
+      rescue Gorelo::Error => e
+        failure = "Uploading #{File.basename(p)} failed: #{e.message}"
+        break
+      end
+      next "Nothing was posted. #{failure}#{orphans(uploaded)}" if failure
+
       payload = { 'ConversationTypeId' => type_id, 'Body' => to_html(args['body']) }
+      payload['Attachments'] = uploaded unless uploaded.empty?
       payload['CreatedByName'] = args['author'] if args['author']
       # ConversationId is rejected for Public and Private - deliberately absent.
 
@@ -1407,12 +1470,17 @@ module GoreloTools
              'been posted. Check the ticket before posting again - a repeat within 24 hours will be ' \
              "refused.\n#{e.message}"
       rescue Gorelo::Error => e
-        next "Nothing was posted. #{e.message}"
+        next "Nothing was posted. #{e.message}#{orphans(uploaded)}"
       end
 
       api.record_write(key, "#{t['DisplayNumber']} ConversationTypeId=#{type_id}")
-      "Posted #{internal ? 'a PRIVATE (internal) note' : 'a PUBLIC, client-visible comment'} " \
-        "to #{t['DisplayNumber']} - #{t['Title']}."
+      out = "Posted #{internal ? 'a PRIVATE (internal) note' : 'a PUBLIC, client-visible comment'} " \
+            "to #{t['DisplayNumber']} - #{t['Title']}."
+      unless uploaded.empty?
+        out += "\nWith #{uploaded.size} attachment(s): #{uploaded.map { |u| u['Name'] }.join(', ')}."
+        out += ' The client can see them.' unless internal
+      end
+      out
     end
   end
 

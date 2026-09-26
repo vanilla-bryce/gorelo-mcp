@@ -35,6 +35,7 @@ ENV.update({
     "GORELO_READ_TIMEOUT": "3",
     "HOME": os.path.join(HERE, "_tmp_home"),
     "GORELO_DOWNLOAD_DIR": os.path.join(HERE, "_tmp_home", "downloads"),
+    "GORELO_ATTACH_DIR": os.path.join(HERE, "_tmp_home", "gorelo-attachments"),
 })
 os.makedirs(ENV["HOME"], exist_ok=True)
 import shutil
@@ -102,6 +103,11 @@ def hits(path):
     url = ENV["GORELO_BASE_URL"] + "/__debug/hits?" + urllib.parse.urlencode({"path": path})
     with urllib.request.urlopen(url) as r:
         return json.load(r)["count"]
+
+
+def uploads():
+    with urllib.request.urlopen(ENV["GORELO_BASE_URL"] + "/__debug/uploads") as r:
+        return json.load(r)
 
 
 PASS, FAIL = 0, 0
@@ -689,6 +695,49 @@ def run_suite():
                     confirm=True)
     check("a comment that fails after the POST is not retried, and may exist",
           hits(CP) == h0 + 1 and "MAY have been posted" in maybe, maybe)
+
+    print("\ncomment attachments")
+    ad = ENV["GORELO_ATTACH_DIR"]
+    os.makedirs(ad, exist_ok=True)
+    with open(os.path.join(ad, "notes.txt"), "w") as f:
+        f.write("Firmware notes\n")
+    with open(os.path.join(ad, "notes2.txt"), "w") as f:
+        f.write("Other notes\n")
+    with open(os.path.join(ad, "big.bin"), "wb") as f:
+        f.truncate(44 * 1024 * 1024 + 1)
+    link = os.path.join(ad, "escape.txt")
+    if os.path.lexists(link):
+        os.remove(link)
+    os.symlink(os.path.join(HERE, "drive.py"), link)
+
+    n0 = len(uploads())
+    for label, name in [("a .. path", "../../drive.py"),
+                        ("a symlink pointing out of the folder", "escape.txt"),
+                        ("an absolute path elsewhere", os.path.join(HERE, "drive.py")),
+                        ("a home-relative path", "~/.gorelo-mcp-writes.jsonl"),
+                        ("a file over 44 MB", "big.bin"),
+                        ("a missing file", "missing.txt")]:
+        r = s2.call("gorelo_add_ticket_comment", ticket="G-1000",
+                    body="Attachment test: " + label, files=[name], confirm=True)
+        check("refused before any upload: " + label,
+              "Refused" in r and len(uploads()) == n0, r)
+    att = s2.call("gorelo_add_ticket_comment", ticket="G-1000",
+                  body="Firmware notes attached.", files=["notes.txt"], confirm=True)
+    body = last_body(CP)
+    check("a file in the folder is uploaded, then referenced by the comment",
+          "Posted" in att and "notes.txt" in att and len(uploads()) == n0 + 1
+          and [a.get("Name") for a in body.get("Attachments", [])] == ["notes.txt"], (att, body))
+    last = (uploads() or [{}])[-1]
+    check("the upload is filed against the ticket",
+          last.get("itemType") == "Ticket"
+          and last.get("itemId") == "00000000-0000-0000-0000-000000001000"
+          and last.get("size") == 15, last)
+    diff = s2.call("gorelo_add_ticket_comment", ticket="G-1000",
+                   body="Firmware notes attached.", files=["notes2.txt"], confirm=True)
+    check("the same text with a different file is not a duplicate", "Posted" in diff, diff)
+    dup = s2.call("gorelo_add_ticket_comment", ticket="G-1000",
+                  body="Firmware notes attached.", files=["notes.txt"], confirm=True)
+    check("the same text with the same file is", "Refused" in dup, dup)
     s2.close()
     ENV["GORELO_ALLOW_WRITES"] = "false"
 

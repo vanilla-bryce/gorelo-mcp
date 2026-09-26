@@ -26,6 +26,7 @@ require 'json'
 require 'digest'
 require 'time'
 require 'fileutils'
+require 'securerandom'
 
 module Gorelo
   class Error < StandardError; end
@@ -117,6 +118,24 @@ module Gorelo
     def post(path, body, query = {})
       guard_writes!
       request(Net::HTTP::Post, path, query: query, body: body)
+    end
+
+    # multipart/form-data upload. The body is built in memory, so a request
+    # retried after a 429 sends the same bytes again. Files are capped at
+    # 44 MB before this is called.
+    def post_multipart(path, fields, file_path)
+      guard_writes!
+      boundary = "gorelo-mcp-#{SecureRandom.hex(16)}"
+      name     = File.basename(file_path).gsub(/["\r\n\\]/, '_')
+      body     = String.new(encoding: Encoding::BINARY)
+      fields.each do |k, v|
+        body << "--#{boundary}\r\nContent-Disposition: form-data; name=\"#{k}\"\r\n\r\n#{v}\r\n".b
+      end
+      body << "--#{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"#{name}\"\r\n" \
+              "Content-Type: application/octet-stream\r\n\r\n".b
+      body << File.binread(file_path) << "\r\n--#{boundary}--\r\n".b
+      request(Net::HTTP::Post, path, raw_body: body,
+                                     content_type: "multipart/form-data; boundary=#{boundary}")
     end
 
     # PATCH exists for tickets, clients and contacts. Only tickets are reachable
@@ -375,7 +394,7 @@ module Gorelo
        user['FirstName'], user['LastName'], user['DisplayName']].compact.join(' ').downcase
     end
 
-    def request(klass, path, query: {}, body: nil, raw: false)
+    def request(klass, path, query: {}, body: nil, raw: false, raw_body: nil, content_type: nil)
       @requests += 1
       uri = URI.join("#{@base_url}/", path.sub(%r{\A/}, ''))
       pairs = query.reject { |_, v| v.nil? || v.to_s.empty? }
@@ -385,7 +404,10 @@ module Gorelo
       req['X-API-Key']    = @api_key
       req['Accept']       = raw ? 'application/pdf, application/json' : 'application/json'
       req['User-Agent']   = 'amit-gorelo-mcp/1.0'
-      if body
+      if raw_body
+        req['Content-Type'] = content_type
+        req.body = raw_body
+      elsif body
         req['Content-Type'] = 'application/json'
         req.body = JSON.generate(body)
       end
