@@ -36,6 +36,7 @@ import json
 import base64
 import re
 import sys
+import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -53,6 +54,9 @@ LAST_QUERY = {}
 
 # The JSON body each POST/PATCH path last received: /__debug/last-body?path=<path>.
 LAST_BODY = {}
+
+# How many POSTs each path has received - proves a failed POST was not retried.
+HITS = {}
 
 
 def ago(days, hours=0):
@@ -805,6 +809,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, LAST_QUERY.get(want, {}))
             if d.path == "/__debug/last-body":
                 return self.reply(200, LAST_BODY.get(want, {}))
+            if d.path == "/__debug/hits":
+                return self.reply(200, {"count": HITS.get(want, 0)})
             return self.reply(404, fail(404, "No debug route %s" % d.path))
         if not self.authorised():
             return
@@ -1083,8 +1089,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorised():
             return
         u = urlparse(self.path)
+        HITS[u.path] = HITS.get(u.path, 0) + 1
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
+        LAST_BODY[u.path] = body
+        if u.path == "/v1/invoices":
+            return self.post_invoice(body)
         m = re.fullmatch(r"/v1/tickets/([^/]+)/comments", u.path)
         if m:
             # Enforce CreatePublicCommentCommand as documented: ConversationId
@@ -1101,8 +1111,66 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write("POSTED to %s ConversationTypeId=%s\n"
                              % (m.group(1), body.get("ConversationTypeId")))
             sys.stderr.flush()
+            # The comment IS stored, then the request fails: the case where a
+            # retry would post it twice.
+            if "BOOM-500" in body.get("Body", ""):
+                return self.reply(500, fail(500, "Internal server error"))
             return self.reply(200, env({"Id": "new-comment"}))
         self.reply(404, fail(404, "No such write path"))
+
+    INVOICE_FIELDS = {"ClientId", "StatusId", "InvoiceDate", "DueDate", "Reference",
+                      "RecipientEmails", "LineItems"}
+    LINE_FIELDS = {"ItemId", "Description", "Quantity", "UnitPrice", "UnitCost",
+                   "DiscountPercent", "TaxId", "CoaCode", "BillableStatusId"}
+
+    def post_invoice(self, body):
+        unknown = set(body) - self.INVOICE_FIELDS
+        if unknown:
+            return self.reply(400, fail(400, "Unknown fields: %s" % sorted(unknown)))
+        if not any(c["Id"] == body.get("ClientId") for c in CLIENTS):
+            return self.reply(404, fail(404, "Client not found"))
+        if body.get("StatusId") not in (None, 1, 5):
+            return self.reply(400, fail(400, "StatusId must be 1 (Draft) or 5 (Approved)"))
+        lines = body.get("LineItems") or []
+        if not lines:
+            return self.reply(400, fail(400, "At least one line item is required"))
+        subtotal = tax = 0.0
+        for l in lines:
+            if set(l) - self.LINE_FIELDS:
+                return self.reply(400, fail(400, "Unknown line fields: %s" % sorted(set(l) - self.LINE_FIELDS)))
+            it = next((i for i in ITEMS if i["Id"] == l.get("ItemId")), None)
+            if not it:
+                return self.reply(400, fail(400, "Unknown ItemId %s" % l.get("ItemId")))
+            if not (l.get("Quantity") or 0) > 0:
+                return self.reply(400, fail(400, "Quantity must be greater than 0"))
+            price = l["UnitPrice"] if l.get("UnitPrice") is not None else (it["UnitPrice"] or 0)
+            amount = round(l["Quantity"] * price, 2)
+            t = next((x for x in TAXES if x["Id"] == it["TaxId"]), None)
+            pct = (sum(s["Percentage"] for s in t["SubTaxes"]) if t and t["SubTaxes"]
+                   else ((t or {}).get("Percentage") or 0))
+            subtotal += amount
+            tax += round(amount * pct / 100, 2)
+        n = max(i["Number"] for i in INVOICES) + 1
+        status = body.get("StatusId") or 1
+        date = (body.get("InvoiceDate") or day(0))[:10]
+        total = round(subtotal + tax, 2)
+        INVOICES.append({
+            "Id": str(uuid.uuid4()), "Number": n, "DisplayNumber": "INV-%04d" % n,
+            "ClientId": body["ClientId"], "ContractId": None,
+            "Status": {"Id": status, "Name": INVOICE_STATUS_NAMES[status]},
+            "InvoiceDate": date, "DueDate": (body.get("DueDate") or date)[:10],
+            "SubTotal": round(subtotal, 2), "TotalDiscount": 0.0, "TotalTax": round(tax, 2),
+            "Total": total, "AmountPaid": 0.0, "AmountDue": total,
+            "Reference": body.get("Reference"), "ExternalId": None, "PaymentLink": None,
+            "InvoiceTemplateId": None, "InvoiceEmailTemplateId": None, "BrandingThemeId": None,
+            "IsEmailSent": False, "EmailSentOn": None,
+            "CreatedOn": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "UpdatedOn": None})
+        # BOOM-500: the invoice IS created, then the request fails - the case
+        # where retrying the POST raises a second invoice.
+        if body.get("Reference") == "BOOM-500":
+            return self.reply(500, fail(500, "Internal server error"))
+        return self.reply(200, env({"Id": INVOICES[-1]["Id"]}))
 
 
 if __name__ == "__main__":

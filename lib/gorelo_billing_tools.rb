@@ -29,12 +29,14 @@ module GoreloBillingTools
   GUID = Gorelo::Client::GUID
   ITEM_TYPE   = { 'product' => 1, 'bundle' => 2 }.freeze
   ITEM_STATUS = { 'active' => 1, 'archived' => 2 }.freeze
+  MAX_LINES = 100
 
   def register(server, api)
     list_invoices(server, api)
     get_invoice_pdf(server, api)
     get_contract(server, api)
     list_items(server, api)
+    create_draft_invoice(server, api)
   end
 
   # ---- invoices -----------------------------------------------------------
@@ -532,6 +534,186 @@ module GoreloBillingTools
         out << ''
         out << "⚠ SELLS BELOW COST - #{below.size}: #{below.map { |i| i['Name'] }.first(12).join(', ')}"
       end
+      out.join("\n")
+    end
+  end
+
+  # ---- draft invoices (write) ---------------------------------------------
+
+  # A write needs exactly one client; a read can take several.
+  def one_client(api, term)
+    matched = api.resolve_clients(term)
+    return [nil, "No client matches #{term.inspect}."] if matched.empty?
+    if matched.size > 1
+      return [nil, "#{matched.size} clients match #{term.inspect}: " \
+                   "#{matched.first(8).map { |c| "#{c['Id']} #{c['Name']}" }.join(', ')}. Narrow it."]
+    end
+
+    [matched.first, nil]
+  end
+
+  def parse_day(value, label)
+    return [nil, nil] if value.nil? || value.to_s.strip.empty?
+
+    [Date.iso8601(value.to_s.strip), nil]
+  rescue Date::Error
+    [nil, "#{label} #{value.inspect} is not a date (YYYY-MM-DD)."]
+  end
+
+  def create_draft_invoice(server, api)
+    server.tool(
+      name:  'gorelo_create_draft_invoice',
+      title: 'Raise a DRAFT invoice in Gorelo',
+      description: <<~TEXT,
+        Raises a manual invoice against one client, ALWAYS AS A DRAFT. A person approves it in
+        Gorelo; approving is what pushes it to Xero/QuickBooks, and that is never done here.
+
+        Each line names a catalogue item (its id or exact name - see gorelo_list_items) and a
+        quantity. Price, cost, tax, account code and billable status come from the item unless
+        unit_price is given. No recipient emails are sent.
+
+        Safety:
+          - disabled unless GORELO_ALLOW_WRITES=true; `confirm: true` required
+          - StatusId is always 1 (Draft); there is no parameter to change it
+          - every line is resolved and checked BEFORE anything is sent
+          - an identical invoice within 24 hours is refused, so a retried call cannot raise two
+          - a server error is never retried, because it may have created the invoice
+          - the new invoice is read back, and its number, status and totals reported
+      TEXT
+      read_only: false,
+      input_schema: {
+        type: 'object',
+        properties: {
+          client: { type: 'string', description: 'Client name fragment or id. Must match exactly one client.' },
+          lines:  {
+            type: 'array', minItems: 1, maxItems: MAX_LINES,
+            items: {
+              type: 'object',
+              properties: {
+                item:        { type: 'string', description: 'Item id, or its exact name.' },
+                quantity:    { type: 'number', description: 'Greater than 0.' },
+                unit_price:  { type: 'number', description: "Optional. Defaults to the item's own price." },
+                description: { type: 'string', description: "Optional. Defaults to the item's description." }
+              },
+              required: %w[item quantity],
+              additionalProperties: false
+            }
+          },
+          reference:    { type: 'string', description: 'Optional invoice reference, e.g. a PO number.' },
+          invoice_date: { type: 'string', description: 'YYYY-MM-DD. Default today.' },
+          due_date:     { type: 'string', description: 'YYYY-MM-DD. Default: the invoice date.' },
+          confirm:      { type: 'boolean', description: 'Must be true. Nothing is created without it.' }
+        },
+        required: %w[client lines confirm],
+        additionalProperties: false
+      }
+    ) do |args|
+      next 'Writes are disabled. Set GORELO_ALLOW_WRITES=true in .env and restart.' unless api.writes_allowed?
+      next 'Refused: confirm must be true. Nothing was created.' unless args['confirm'] == true
+
+      client, why = one_client(api, args['client'])
+      next "#{why} Nothing was created." unless client
+
+      raw = Array(args['lines'])
+      next 'Refused: give at least one line. Nothing was created.' if raw.empty?
+      next "Refused: at most #{MAX_LINES} lines. Nothing was created." if raw.size > MAX_LINES
+
+      invoice_date, why = parse_day(args['invoice_date'], 'invoice_date')
+      next "Refused: #{why} Nothing was created." if why
+
+      due_date, why = parse_day(args['due_date'], 'due_date')
+      next "Refused: #{why} Nothing was created." if why
+      if due_date && due_date < (invoice_date || Date.today)
+        next 'Refused: due_date is before the invoice date. Nothing was created.'
+      end
+
+      # Every line is resolved and checked before anything is sent, and every
+      # problem is reported at once rather than one per attempt.
+      problems = []
+      lines = raw.each_with_index.filter_map do |l, n|
+        where = "line #{n + 1}"
+        unless l['quantity'].is_a?(Numeric) && l['quantity'].positive?
+          problems << "#{where}: quantity must be greater than 0"
+          next
+        end
+        unless l['unit_price'].nil? || (l['unit_price'].is_a?(Numeric) && l['unit_price'] >= 0)
+          problems << "#{where}: unit_price must be 0 or more"
+          next
+        end
+        item, item_why = find_item(api, l['item'], active_only: true)
+        unless item
+          problems << "#{where}: #{item_why}"
+          next
+        end
+        { item: item, quantity: l['quantity'], unit_price: l['unit_price'], description: l['description'] }
+      end
+      next "Refused - nothing was created:\n  #{problems.join("\n  ")}" unless problems.empty?
+
+      payload = {
+        'ClientId'  => client['Id'],
+        'StatusId'  => STATUS_DRAFT,
+        'LineItems' => lines.map do |l|
+          li = { 'ItemId' => l[:item]['Id'], 'Quantity' => l[:quantity] }
+          li['UnitPrice']   = l[:unit_price] unless l[:unit_price].nil?
+          li['Description'] = l[:description] unless l[:description].to_s.strip.empty?
+          li
+        end
+      }
+      payload['Reference']   = args['reference'].to_s.strip unless args['reference'].to_s.strip.empty?
+      payload['InvoiceDate'] = invoice_date.iso8601 if invoice_date
+      payload['DueDate']     = due_date.iso8601 if due_date
+      # Deliberately absent: RecipientEmails (nothing is emailed from here), and
+      # UnitCost, TaxId, CoaCode, BillableStatusId and DiscountPercent, which
+      # fall back to the item's own values.
+
+      key = api.fingerprint('invoice', payload.to_json)
+      if api.write_fingerprint_seen?(key)
+        next "Refused: an identical draft invoice for #{client['Name']} was already raised in the " \
+             'last 24 hours. Nothing was created. Change the reference if a second one is really wanted.'
+      end
+
+      before = Time.now.utc - 120
+      begin
+        id = api.post('/v1/invoices', payload).dig('Data', 'Id')
+      rescue Gorelo::AmbiguousWrite => e
+        api.record_write(key, "POST /v1/invoices #{client['Name']} AMBIGUOUS")
+        next "⚠ Gorelo failed AFTER receiving the invoice for #{client['Name']}, so it MAY have been " \
+             "created. Check the client's draft invoices (gorelo_list_invoices) before trying again - " \
+             "a repeat within 24 hours will be refused.\n#{e.message}"
+      rescue Gorelo::Error => e
+        next "Nothing was created. #{e.message}"
+      end
+      api.record_write(key, "POST /v1/invoices #{client['Name']} → #{id}")
+
+      # There is no GET /v1/invoices/{id}, so the new invoice is found by listing
+      # this client's invoices created since just before the POST.
+      row = begin
+        api.get_all('/v1/invoices', { 'ClientIds' => client['Id'], 'CreatedSince' => before.iso8601 })
+           .find { |i| i['Id'].to_s == id.to_s }
+      rescue Gorelo::Error
+        nil
+      end
+      unless row
+        next "⚠ Gorelo returned invoice id #{id} for #{client['Name']}, but it could NOT be read back. " \
+             'Check in Gorelo before assuming it exists, or raising it again.'
+      end
+
+      draft = nested(row, 'Status', 'Id') == STATUS_DRAFT
+      out = []
+      out << if draft
+               "Created DRAFT invoice #{row['DisplayNumber']} for #{client['Name']}. Verified by reading it back."
+             else
+               "⚠ Created invoice #{row['DisplayNumber']} for #{client['Name']}, but Gorelo reports it as " \
+                 "#{nested(row, 'Status', 'Name').inspect}, NOT Draft. Check it in Gorelo now."
+             end
+      out << "Subtotal #{money(row['SubTotal'])} · tax #{money(row['TotalTax'])} · total #{money(row['Total'])} · " \
+             "dated #{row['InvoiceDate'].to_s[0, 10]} · due #{row['DueDate'].to_s[0, 10]}"
+      lines.each do |l|
+        price = l[:unit_price].nil? ? l[:item]['UnitPrice'] : l[:unit_price]
+        out << "  #{format('%7.2f', l[:quantity])} x #{pad(l[:item]['Name'], 36)}#{money(price).rjust(10)}" \
+               "#{l[:unit_price].nil? ? '' : '  (price given)'}"
+      end
+      out << 'Not approved, not emailed, not sent to accounting. Review and approve it in Gorelo.' if draft
       out.join("\n")
     end
   end

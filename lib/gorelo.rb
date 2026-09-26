@@ -32,6 +32,11 @@ module Gorelo
   class AuthError < Error; end
   class WritesDisabled < Error; end
 
+  # A POST that failed with a server error. It MAY have been applied - a 5xx
+  # says nothing either way - so it is never retried: retrying a POST that did
+  # land raises a second invoice or posts a second comment.
+  class AmbiguousWrite < Error; end
+
   # A failure that waiting might fix: rate limits and server faults.
   class RetryableError < Error
     attr_reader :retry_after, :short
@@ -388,7 +393,7 @@ module Gorelo
       http.open_timeout = 15
       http.read_timeout = 60
 
-      with_retry(path) { handle(http.request(req), uri, raw: raw) }
+      with_retry(path) { handle(http.request(req), uri, raw: raw, retry_5xx: klass != Net::HTTP::Post) }
     rescue Net::OpenTimeout, Net::ReadTimeout => e
       raise Error, "Gorelo timed out calling #{path}: #{e.class}"
     rescue SocketError => e
@@ -414,7 +419,7 @@ module Gorelo
       end
     end
 
-    def handle(res, uri, raw: false)
+    def handle(res, uri, raw: false, retry_5xx: true)
       code = res.code.to_i
 
       # Auth failures must always surface plainly. Reporting them as "no data"
@@ -464,6 +469,13 @@ module Gorelo
           raise Error, "#{message}\n  405 means this PATH EXISTS but does not accept GET - " \
                        "it is defined for another verb (POST, PATCH or DELETE).\n  This server " \
                        'only ever issues GET, so the endpoint is real but not readable from here.'
+        end
+
+        # A 429 was never processed, so it is always safe to retry. A 5xx on a
+        # POST may have been processed, so it is not.
+        if code >= 500 && !retry_5xx
+          raise AmbiguousWrite, "#{message}\n  Not retried: this was a POST, and a server error " \
+                                'does not say whether it was applied. Check Gorelo before trying again.'
         end
 
         if code == 429 || code >= 500

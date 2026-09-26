@@ -96,6 +96,13 @@ def last_body(path):
         return json.load(r)
 
 
+def hits(path):
+    """How many POSTs the mock has received on `path`."""
+    url = ENV["GORELO_BASE_URL"] + "/__debug/hits?" + urllib.parse.urlencode({"path": path})
+    with urllib.request.urlopen(url) as r:
+        return json.load(r)["count"]
+
+
 PASS, FAIL = 0, 0
 
 
@@ -114,7 +121,7 @@ def run_suite():
 
     tools = s.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
     names = [t["name"] for t in tools]
-    check("22 tools advertised", len(tools) == 22, names)
+    check("23 tools advertised", len(tools) == 23, names)
     # There is deliberately no way to DELETE from this server. The strongest
     # form of that is structural: the client has no such method to call.
     lib = os.path.abspath(os.path.join(HERE, "..", "lib", "gorelo.rb"))
@@ -126,10 +133,17 @@ def run_suite():
     check("no tool takes an HTTP method or verb",
           not any(k in ("method", "verb", "http_method")
                   for t in tools for k in t["inputSchema"].get("properties", {})))
-    check("exactly three tools write, and none can delete",
+    check("exactly four tools write, and none can delete",
           sorted(t["name"] for t in tools if not t["annotations"]["readOnlyHint"])
-          == ["gorelo_add_ticket_comment", "gorelo_set_uptime_maintenance",
-              "gorelo_update_ticket"])
+          == ["gorelo_add_ticket_comment", "gorelo_create_draft_invoice",
+              "gorelo_set_uptime_maintenance", "gorelo_update_ticket"])
+    inv_props = next((t for t in tools if t["name"] == "gorelo_create_draft_invoice"),
+                     {"inputSchema": {"properties": {"status": 1}}})["inputSchema"]["properties"]
+    check("a draft invoice has no status parameter - approving stays a human action",
+          not any(k.lower() in ("status", "statusid", "approve", "approved") for k in inv_props),
+          sorted(inv_props))
+    check("and no recipient-email parameter",
+          not any("email" in k.lower() for k in inv_props), sorted(inv_props))
 
     print("\ncounting")
     everything = s.call("gorelo_list_tickets", status="all", limit=300)
@@ -480,6 +494,10 @@ def run_suite():
     check("uptime maintenance refused when disabled",
           "Writes are disabled" in s.call("gorelo_set_uptime_maintenance", check="head office",
                                           action="start", minutes=60, reason="x", confirm=True))
+    check("draft invoice refused when disabled",
+          "Writes are disabled" in s.call("gorelo_create_draft_invoice", client="Fabrikam",
+                                          lines=[{"item": "Managed desktop seat", "quantity": 1}],
+                                          confirm=True))
 
     print("\nprobe")
     # The 2026-08-21 release added DELETE endpoints for tickets, clients,
@@ -611,6 +629,56 @@ def run_suite():
                        minutes=10080, reason="Rebuild extended", confirm=True)
     check("an ignored replacement window is caught, not reported as verified",
           "DID NOT TAKE EFFECT" in replaced and "Verified" not in replaced, replaced)
+
+    print("\ndraft invoices")
+    P = "/v1/invoices"
+    LINES = [{"item": "Managed desktop seat", "quantity": 2},
+             {"item": "New starter bundle", "quantity": 1, "unit_price": 1850}]
+    check("confirm required", "confirm must be true" in
+          s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES, confirm=False))
+    amb = s2.call("gorelo_create_draft_invoice", client="a", lines=LINES, confirm=True)
+    check("an ambiguous client is refused, never guessed",
+          "clients match" in amb and "Nothing was created" in amb, amb)
+    h0 = hits(P)
+    bad = s2.call("gorelo_create_draft_invoice", client="Fabrikam",
+                  lines=[{"item": "Managed desktop seat", "quantity": 0},
+                         {"item": "Microsoft", "quantity": 1},
+                         {"item": "Legacy AV licence", "quantity": 1}], confirm=True)
+    check("every line is checked, and all problems reported, before anything is sent",
+          "line 1: quantity" in bad and "line 2: No active item is named exactly" in bad
+          and "line 3: No active item" in bad and hits(P) == h0, bad)
+    made = s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
+                   reference="MCP-TEST", confirm=True)
+    sent = last_body(P)
+    sent_lines = sent.get("LineItems") or [{}, {}]
+    check("the invoice is created as a DRAFT and verified by reading back",
+          "Created DRAFT invoice INV-" in made and "Verified" in made, made)
+    check("StatusId 1 is always sent", sent.get("StatusId") == 1, sent)
+    check("no recipient emails, and nothing the item should supply",
+          "RecipientEmails" not in sent
+          and all(set(l) <= {"ItemId", "Quantity", "UnitPrice", "Description"} for l in sent_lines),
+          sent)
+    check("a given unit price is sent; an omitted one is left to the item",
+          "UnitPrice" not in sent_lines[0] and sent_lines[1].get("UnitPrice") == 1850, sent)
+    check("the totals are Gorelo's, from the read-back", "total 2222.00" in made, made)
+    again = s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
+                    reference="MCP-TEST", confirm=True)
+    check("an identical invoice within 24h is refused",
+          "Refused" in again and "already raised" in again, again)
+    h0 = hits(P)
+    boom = s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
+                   reference="BOOM-500", confirm=True)
+    check("a server error after the POST is NOT retried", hits(P) == h0 + 1, (h0, hits(P)))
+    check("and the reply says the invoice MAY exist", "MAY have been created" in boom, boom)
+    check("and a repeat is refused", "Refused" in
+          s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
+                  reference="BOOM-500", confirm=True))
+    CP = "/v1/tickets/00000000-0000-0000-0000-000000001000/comments"
+    h0 = hits(CP)
+    maybe = s2.call("gorelo_add_ticket_comment", ticket="G-1000", body="BOOM-500 comment",
+                    confirm=True)
+    check("a comment that fails after the POST is not retried, and may exist",
+          hits(CP) == h0 + 1 and "MAY have been posted" in maybe, maybe)
     s2.close()
     ENV["GORELO_ALLOW_WRITES"] = "false"
 

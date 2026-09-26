@@ -1401,6 +1401,11 @@ module GoreloTools
 
       begin
         api.post("/v1/tickets/#{t['Id']}/comments", payload)
+      rescue Gorelo::AmbiguousWrite => e
+        api.record_write(key, "#{t['DisplayNumber']} AMBIGUOUS ConversationTypeId=#{type_id}")
+        next "⚠ Gorelo failed AFTER receiving the comment for #{t['DisplayNumber']}, so it MAY have " \
+             'been posted. Check the ticket before posting again - a repeat within 24 hours will be ' \
+             "refused.\n#{e.message}"
       rescue Gorelo::Error => e
         next "Nothing was posted. #{e.message}"
       end
