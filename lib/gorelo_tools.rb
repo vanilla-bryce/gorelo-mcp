@@ -1369,6 +1369,8 @@ module GoreloTools
       File.realpath(File.expand_path(name.to_s, root))
     rescue SystemCallError
       return [nil, "#{name}: no such file in #{root}"]
+    rescue ArgumentError
+      return [nil, "#{name.inspect}: not a usable file name"]
     end
     return [nil, "#{name}: outside #{root} - only files in that folder can be attached"] unless real.start_with?("#{root}/")
     return [nil, "#{name}: not a regular file"] unless File.file?(real)
@@ -1431,15 +1433,19 @@ module GoreloTools
       t = find_ticket(api, args['ticket'])
       next "Could not find ticket #{args['ticket']} - nothing was posted." unless t
 
-      checked  = Array(args['files']).map { |f| attachment_path(f) }
+      files = Array(args['files']).uniq
+      next 'Refused - at most 10 files. Nothing was posted or uploaded.' if files.size > 10
+
+      checked  = files.map { |f| attachment_path(f) }
       problems = checked.filter_map { |_, why| why }
       next "Refused - nothing was posted or uploaded:\n  #{problems.join("\n  ")}" unless problems.empty?
 
       paths = checked.map(&:first)
       # With no files this is the same fingerprint as before, so the 24-hour
-      # duplicate guard carries on across the upgrade.
+      # duplicate guard carries on across the upgrade. Sorted so the same files
+      # in a different order are still recognised as the same comment.
       key = api.fingerprint(t['Id'], args['body'].strip, type_id,
-                            *paths.map { |p| Digest::SHA256.file(p).hexdigest })
+                            *paths.map { |p| Digest::SHA256.file(p).hexdigest }.sort)
       if api.write_fingerprint_seen?(key)
         next "Refused: an identical comment was already posted to #{t['DisplayNumber']} in the " \
              'last 24 hours. Nothing was sent.'
@@ -1451,8 +1457,18 @@ module GoreloTools
       paths.each do |p|
         d = api.post_multipart('/v1/attachments', { 'itemType' => 'Ticket', 'itemId' => t['Id'] }, p)['Data']
         uploaded << { 'Name' => d['Name'], 'Url' => d['Url'] }
+      rescue Gorelo::AmbiguousWrite => e
+        # A 5xx or read timeout AFTER the upload POST went out: Gorelo may have
+        # stored it anyway, so it is neither "uploaded" (we have no Name/Url
+        # back to reference it by) nor safely un-said.
+        failure = "#{File.basename(p)} MAY have been uploaded - Gorelo failed after receiving it, " \
+                  "so it could already be on the ticket and unreferenced.\n#{e.message}"
+        break
       rescue Gorelo::Error => e
         failure = "Uploading #{File.basename(p)} failed: #{e.message}"
+        break
+      rescue StandardError => e
+        failure = "Uploading #{File.basename(p)} failed: #{e.class}: #{e.message}"
         break
       end
       next "Nothing was posted. #{failure}#{orphans(uploaded)}" if failure
@@ -1466,9 +1482,14 @@ module GoreloTools
         api.post("/v1/tickets/#{t['Id']}/comments", payload)
       rescue Gorelo::AmbiguousWrite => e
         api.record_write(key, "#{t['DisplayNumber']} AMBIGUOUS ConversationTypeId=#{type_id}")
-        next "⚠ Gorelo failed AFTER receiving the comment for #{t['DisplayNumber']}, so it MAY have " \
-             'been posted. Check the ticket before posting again - a repeat within 24 hours will be ' \
-             "refused.\n#{e.message}"
+        msg = "⚠ Gorelo failed AFTER receiving the comment for #{t['DisplayNumber']}, so it MAY have " \
+              'been posted. Check the ticket before posting again - a repeat within 24 hours will be ' \
+              "refused.\n#{e.message}"
+        unless uploaded.empty?
+          msg += "\nIf the comment did not post, these files are on the ticket and referenced by " \
+                 "nothing: #{uploaded.map { |u| u['Name'] }.join(', ')}."
+        end
+        next msg
       rescue Gorelo::Error => e
         next "Nothing was posted. #{e.message}#{orphans(uploaded)}"
       end

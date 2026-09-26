@@ -738,6 +738,24 @@ def run_suite():
     dup = s2.call("gorelo_add_ticket_comment", ticket="G-1000",
                   body="Firmware notes attached.", files=["notes.txt"], confirm=True)
     check("the same text with the same file is", "Refused" in dup, dup)
+
+    with open(os.path.join(ad, "boom.txt"), "w") as f:
+        f.write("boom\n")
+    c0, n0 = hits(CP), len(uploads())
+    orphan = s2.call("gorelo_add_ticket_comment", ticket="G-1000",
+                     body="Orphan test.", files=["notes2.txt", "boom.txt"], confirm=True)
+    check("a failed upload names what MAY be uploaded and what is now orphaned, and posts nothing",
+          "boom.txt MAY have been uploaded" in orphan and "notes2.txt" in orphan.split("referenced by nothing")[-1]
+          and hits(CP) == c0 and len(uploads()) == n0 + 2, orphan)
+    order1 = s2.call("gorelo_add_ticket_comment", ticket="G-1000",
+                     body="Two files.", files=["notes.txt", "notes2.txt"], confirm=True)
+    order2 = s2.call("gorelo_add_ticket_comment", ticket="G-1000",
+                     body="Two files.", files=["notes2.txt", "notes.txt"], confirm=True)
+    check("the same files in a different order are still a duplicate",
+          "Posted" in order1 and "Refused" in order2, (order1, order2))
+    check("more than 10 files is refused", "at most 10 files" in
+          s2.call("gorelo_add_ticket_comment", ticket="G-1000", body="Too many.",
+                  files=["notes.txt"] + ["x%d.txt" % i for i in range(10)], confirm=True))
     s2.close()
     ENV["GORELO_ALLOW_WRITES"] = "false"
 

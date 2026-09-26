@@ -1155,10 +1155,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(400, fail(400, "itemType must be Ticket, Task or Project"))
         if fields["itemType"] == "Ticket" and not any(t["Id"] == fields.get("itemId") for t in TICKETS):
             return self.reply(404, fail(404, "Ticket not found"))
-        url = "https://files.example.invalid/%s?token=t0k3n" % uuid.uuid4()
-        ISSUED_URLS.add(url)
         UPLOADS.append({"itemType": fields["itemType"], "itemId": fields.get("itemId"),
                         "name": upload[0], "size": len(upload[1])})
+        # boom.txt: the file IS stored (it's in UPLOADS above), then the
+        # request fails - the case where the client cannot tell whether the
+        # upload landed.
+        if upload[0] == "boom.txt":
+            return self.reply(500, fail(500, "Internal server error"))
+        url = "https://files.example.invalid/%s?token=t0k3n" % uuid.uuid4()
+        ISSUED_URLS.add(url)
         return self.reply(200, env({"Name": upload[0], "Url": url}))
 
     INVOICE_FIELDS = {"ClientId", "StatusId", "InvoiceDate", "DueDate", "Reference",
