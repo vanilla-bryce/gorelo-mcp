@@ -228,7 +228,9 @@ Starts or ends a maintenance window on **one** uptime check, and sends **only**
 `MaintenanceMode` — never the target, type, client or tags. A check in maintenance raises no
 alerts, so the risk here is silence, not damage:
 
-- `start` needs a **reason** and a **duration** (1–10,080 minutes). A duration of `0` means the
+- `start` needs a **reason** and a **duration** (1–10,080 minutes). A duration outside that
+  range, both a duration and `indefinite`, or an action other than `start`/`end` is refused
+  before sending. A duration of `0` means the
   window never ends, so it can only be sent with **`indefinite: true`** — never from a default,
   a missing value or a typo.
 - The PATCH has no "updated by" field, so the reason is prefixed **`[Gorelo MCP]`**.
@@ -236,6 +238,11 @@ alerts, so the risk here is silence, not damage:
   fields it doesn't recognise. On a `start`, the read-back compares the **reason as well as the
   duration**, so a replacement window Gorelo accepted but ignored — leaving the old window's
   duration and reason in place — is reported as failed, not verified.
+- If the PATCH itself fails in a way that doesn't prove Gorelo said no — a timeout, a dropped
+  connection, a 5xx that outlasted the retries — the change is **never reported as refused**.
+  The check is read back anyway, the write is logged as `UNVERIFIED`, and the reply says the
+  change **MAY have been applied**, what the read-back shows, and whether that matches what
+  was sent. Only an auth failure or a 4xx is reported as refused.
 
 `gorelo_list_uptime` names every window that never expires or has run more than seven days.
 
@@ -251,16 +258,19 @@ and that stays a person's decision, made in Gorelo.
 - **No `RecipientEmails`** is ever sent. Cost, tax, account code and billable status come from
   the item.
 - An identical invoice within 24 hours is refused, using the same fingerprint log as comments.
+  The fingerprint is taken over normalised values, so `2` and `2.0` are the same quantity.
 - The POST returns only an id and there is no `GET /v1/invoices/{id}`, so the tool lists that
-  client's invoices created since just before the call and finds the id — then reports the
+  client's invoices created in the last day and finds the id — then reports the
   number, status and totals as Gorelo computed them.
 
-**A server error on a POST is never retried** — for invoices and comments alike. A 5xx says
-nothing about whether the write was applied, and retrying a POST that *was* applied raises a
-second invoice. A read timeout waiting for Gorelo's reply is treated the same way: the request
-may already have reached the server, so it is just as ambiguous as a 5xx and is likewise never
-retried. The reply says it *may* exist, and the fingerprint is recorded so a repeat is
-refused. A 429 is still retried: a rate-limited request was never processed.
+**A POST whose outcome is unknown is never retried** — for invoices, comments and uploads
+alike. That covers a 5xx, a read timeout, a connection dropped or reset after the body went
+out (EOF, reset, broken pipe, TLS failure, write timeout), and a success status whose reply
+can't be read. None of those says whether the write was applied, and retrying a POST that
+*was* applied raises a second invoice. The reply says it *may* exist, and the fingerprint is
+recorded so a repeat is refused. Only failures that happen before anything is sent — a
+refused connection, a connect timeout, a DNS failure — are reported as "nothing was
+created". A 429 is still retried: a rate-limited request was never processed.
 
 #### Attachments on `gorelo_add_ticket_comment`
 
@@ -271,13 +281,17 @@ into attaching `~/.ssh/id_rsa` or this project's `.env` to a public comment. Pat
 with `realpath` **before** the check, so `..`, `~` and symlinks can't step outside. Each file
 must be under Gorelo's 44 MB limit, and every check runs before any upload.
 
+Keep `GORELO_ATTACH_DIR` **empty except while you are attaching something**: the folder is
+the whole boundary, so a crafted ticket can still get any file that happens to be sitting in
+it attached to that ticket.
+
 At most **10 files** can be attached to one comment, with duplicate names collapsed before
 that count is checked, so passing the same file name twice doesn't cost two of the ten.
 
 If an upload or the comment fails after some files were uploaded, those files stay on the
 ticket with nothing referencing them — the API has no way to remove them — and the reply names
-them; a file whose own upload failed ambiguously (a 5xx or timeout after the POST reached
-Gorelo) is instead named as one that "MAY have been uploaded," since there's no id back to
+them; a file whose own upload failed ambiguously (a 5xx, timeout, dropped connection or
+unreadable reply after the POST reached Gorelo) is instead named as one that "MAY have been uploaded," since there's no id back to
 confirm it landed.
 
 ### There is no DELETE, anywhere
@@ -382,9 +396,10 @@ deleted along with the behaviour that made it necessary.
 *An entry has no client.* It names its `Ticket` and nothing else. **Filtering** by client
 is now done by the API with `ClientIds` (see the 25 September release below), but
 **grouping** entries by client across several clients still needs a ticket-to-client
-lookup. This server builds one with a **single paged sweep of `/v1/tickets`**, cached for
-the life of the process, and says so in the reply — never a fetch per entry, which is the
-N+1 the new endpoint exists to remove.
+lookup. This server builds one with a **single paged sweep of `/v1/tickets`** — scoped with
+`ClientIds` to just the matched clients' tickets when a client filter was given, otherwise
+the whole tenant, cached for the life of the process — and says so in the reply. Never a
+fetch per entry, which is the N+1 the new endpoint exists to remove.
 
 ### The 25 September 2026 release
 
@@ -396,9 +411,11 @@ hedged every reply. The spec now documents `StartedSince`, `StartedBefore`,
 `CreatedSince`/`Before`, `UpdatedSince`/`Before`, and the id filters `ClientIds`,
 `LocationIds`, `TicketIds`, `TaskIds`, `UserIds` and `InvoiceIds`. The server now sends
 `StartedSince`, `UserIds`, `ClientIds` and `TicketIds`. Checked against a live tenant: a
-7-day report is **one request** and nothing from before the window comes back. The window
-is still re-checked locally, but only as a safety net, and a reply warns if it ever catches
-anything.
+7-day report is **one request** and nothing from before the window comes back. Because the
+API silently ignores names it doesn't recognise, the window, `UserIds` and `TicketIds` are
+still re-checked locally on every entry, as a safety net: a row that fails is dropped, and
+the reply names the filter that wasn't honoured. `ClientIds` can't be re-checked — an entry
+carries no client — so it is trusted.
 
 *`AdjustedHours` can be null, and null does not mean zero.* The spec now says
 `AdjustedHours` is **null when no rounding applied, and the billed duration is then
@@ -560,7 +577,7 @@ python3 test/mock_gorelo.py       # in one terminal
 python3 test/drive.py             # in another
 ```
 
-187 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
+207 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
 assisting assignees, watcher-only exclusion, closed-ticket exclusion, lookup by number,
 deleted comments, cursor pagination, rate-limit retry, every write guard, and the protocol
 edge cases (unknown method, unknown tool, malformed input). The driver sets
