@@ -47,9 +47,9 @@ OTHER = 3001       # a colleague
 
 NOW = datetime.now(timezone.utc)
 
-# The query string /v1/time-entries last received, for asserting which
-# parameter names a tool actually sends.
-LAST_TE_QUERY = {}
+# The query string each GET path last received, for asserting which parameter
+# names a tool actually sends. Read it at /__debug/last-query?path=<path>.
+LAST_QUERY = {}
 
 
 def ago(days, hours=0):
@@ -488,6 +488,40 @@ COMMENTS = {
     ]
 }
 
+# --- invoices (Gorelo, 25 Sep 2026) ---------------------------------------
+def day(d):
+    """A calendar date d days ago (negative for the future), as the API sends it."""
+    return (NOW - timedelta(days=d)).date().isoformat()
+
+
+INVOICE_STATUS_NAMES = {1: "Draft", 3: "Paid", 4: "Void", 5: "Approved"}
+
+
+def invoice(n, client, status, date_ago, due_ago, total, paid, emailed, contract=None):
+    tax = round(total / 11, 2)
+    return {"Id": "1a000000-0000-4000-8000-%012d" % n, "Number": n,
+            "DisplayNumber": "INV-%04d" % n, "ClientId": client, "ContractId": contract,
+            "Status": {"Id": status, "Name": INVOICE_STATUS_NAMES[status]},
+            "InvoiceDate": day(date_ago), "DueDate": day(due_ago),
+            "SubTotal": round(total - tax, 2), "TotalDiscount": 0.0, "TotalTax": tax,
+            "Total": total, "AmountPaid": paid, "AmountDue": max(0.0, round(total - paid, 2)),
+            "Reference": None, "ExternalId": None, "PaymentLink": None,
+            "InvoiceTemplateId": None, "InvoiceEmailTemplateId": None,
+            "BrandingThemeId": None, "IsEmailSent": emailed,
+            "EmailSentOn": ago(date_ago) if emailed else None,
+            "CreatedOn": ago(date_ago), "UpdatedOn": None}
+
+
+INVOICES = [
+    invoice(901, 11001, 3, 200, 186, 5335.00, 5335.00, True, 5001),  # outside a 90-day window
+    invoice(1041, 11001, 3, 40, 26, 5335.00, 5335.00, True, 5001),
+    invoice(1042, 11001, 5, 24, 10, 5335.00, 0.00, True, 5001),      # OVERDUE
+    invoice(1043, 11002, 5, 5, -9, 1419.00, 0.00, False, 5002),      # approved, never emailed
+    invoice(1044, 11003, 1, 30, 20, 990.00, 0.00, False),            # draft past its due date: NOT overdue
+    invoice(1045, 11004, 4, 12, -2, 13200.00, 0.00, True, 5004),     # void
+]
+
+
 POSTED = []
 
 
@@ -517,6 +551,26 @@ def paginate(rows, q):
     return page, {"NextCursor": base64.b64encode(str(nxt).encode()).decode() if more else None,
                   "PreviousCursor": None, "HasMore": more, "HasPrevious": start > 0,
                   "TotalCount": len(rows)}
+
+
+def q_ids(q, name):
+    """A comma-separated id filter as a set of strings, or None when absent."""
+    raw = q.get(name, [None])[0]
+    return {x for x in raw.split(",") if x} if raw else None
+
+
+def q_instant(q, name):
+    """An ISO-8601 query value as an aware UTC datetime, or None."""
+    raw = q.get(name, [None])[0]
+    if not raw:
+        return None
+    t = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def page_too_big(q):
+    """The 25 Sept endpoints REJECT PageSize outside 1-200 rather than clamp it."""
+    return not 1 <= int(q.get("PageSize", ["50"])[0]) <= 200
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -570,12 +624,17 @@ class Handler(BaseHTTPRequestHandler):
         return self.reply(200, env(hit))
 
     def do_GET(self):
-        if urlparse(self.path).path == "/__debug/time-entries-query":
-            return self.reply(200, LAST_TE_QUERY)
+        d = urlparse(self.path)
+        if d.path.startswith("/__debug/"):
+            want = parse_qs(d.query).get("path", [""])[0]
+            if d.path == "/__debug/last-query":
+                return self.reply(200, LAST_QUERY.get(want, {}))
+            return self.reply(404, fail(404, "No debug route %s" % d.path))
         if not self.authorised():
             return
         u = urlparse(self.path)
         path, q = u.path, parse_qs(u.query)
+        LAST_QUERY[path] = {k: v[0] for k, v in q.items()}
 
         # Test-only endpoints for the retry logic.
         # A DELETE-only route: exists, but rejects GET with 405. This is how
@@ -618,12 +677,37 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/time-entries/statuses":
             return self.reply(404, fail(404, "No route /v1/time-entries/statuses"))
 
+        if path == "/v1/invoices":
+            if page_too_big(q):
+                return self.reply(400, fail(400, "PageSize must be 1-200"))
+            rows = INVOICES
+            for name, key in (("ClientIds", lambda i: i["ClientId"]),
+                              ("StatusIds", lambda i: i["Status"]["Id"]),
+                              ("ContractIds", lambda i: i["ContractId"])):
+                want = q_ids(q, name)
+                if want is not None:
+                    rows = [i for i in rows if str(key(i)) in want]
+            if q.get("Number"):
+                rows = [i for i in rows if str(i["Number"]) == q["Number"][0]]
+            if q.get("InvoiceDateSince"):
+                rows = [i for i in rows if i["InvoiceDate"] >= q["InvoiceDateSince"][0][:10]]
+            if q.get("IsEmailSent"):
+                rows = [i for i in rows if i["IsEmailSent"] == (q["IsEmailSent"][0] == "true")]
+            since = q_instant(q, "CreatedSince")
+            if since:
+                rows = [i for i in rows if q_instant({"t": [i["CreatedOn"]]}, "t") >= since]
+            text = q.get("Query", [""])[0].lower()
+            if text:
+                rows = [i for i in rows
+                        if text in (i["DisplayNumber"] + " " + (i["Reference"] or "")).lower()]
+            rows = sorted(rows, key=lambda i: i["InvoiceDate"], reverse=True)
+            rows, pag = paginate(rows, q)
+            return self.reply(200, env(rows, pag))
+
         if path == "/v1/time-entries":
             # Honours the documented filters and IGNORES every other name,
             # exactly as the real API does. CreatedSince - the name this server
             # used to guess - is therefore ignored and returns everything.
-            LAST_TE_QUERY.clear()
-            LAST_TE_QUERY.update({k: v[0] for k, v in q.items()})
             rows = TIME_ENTRIES
 
             def when(name):

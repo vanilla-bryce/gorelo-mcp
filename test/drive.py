@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -74,10 +75,15 @@ class Server:
         return self.p.stderr.read()
 
 
-def te_query():
-    """The query string the mock's /v1/time-entries last received."""
-    with urllib.request.urlopen(ENV["GORELO_BASE_URL"] + "/__debug/time-entries-query") as r:
+def last_query(path):
+    """The query string the mock last received for a GET on `path`."""
+    url = ENV["GORELO_BASE_URL"] + "/__debug/last-query?" + urllib.parse.urlencode({"path": path})
+    with urllib.request.urlopen(url) as r:
         return json.load(r)
+
+
+def te_query():
+    return last_query("/v1/time-entries")
 
 
 PASS, FAIL = 0, 0
@@ -98,7 +104,18 @@ def run_suite():
 
     tools = s.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
     names = [t["name"] for t in tools]
-    check("16 tools advertised", len(tools) == 16, names)
+    check("17 tools advertised", len(tools) == 17, names)
+    # There is deliberately no way to DELETE from this server. The strongest
+    # form of that is structural: the client has no such method to call.
+    lib = os.path.abspath(os.path.join(HERE, "..", "lib", "gorelo.rb"))
+    rc = subprocess.run(["ruby", "-e",
+                         "require ARGV[0]; m = Gorelo::Client.instance_methods(false) + "
+                         "Gorelo::Client.private_instance_methods(false); "
+                         "exit(m.grep(/delete/).empty? ? 0 : 1)", lib]).returncode
+    check("Gorelo::Client has no delete method at all", rc == 0, rc)
+    check("no tool takes an HTTP method or verb",
+          not any(k in ("method", "verb", "http_method")
+                  for t in tools for k in t["inputSchema"].get("properties", {})))
     check("exactly two tools write, and neither can delete",
           sorted(t["name"] for t in tools if not t["annotations"]["readOnlyHint"])
           == ["gorelo_add_ticket_comment", "gorelo_update_ticket"])
@@ -303,6 +320,33 @@ def run_suite():
     empty = s.call("gorelo_list_time_entries", client="Wingtip", user="alex", days=3)
     check("an empty result says how many rows it looked at",
           "No time entries" in empty and "came back from /v1/time-entries" in empty, empty)
+
+    print("\ninvoices (Gorelo, 25 Sep 2026)")
+    inv = s.call("gorelo_list_invoices")
+    check("the default window is 90 days of invoice dates, sent to the API",
+          "INV-1042" in inv and "INV-0901" not in inv
+          and "InvoiceDateSince" in last_query("/v1/invoices"), inv[:600])
+    check("totals are broken down by status",
+          "Approved" in inv and "Void" in inv and "still due" in inv, inv[:600])
+    unsent = inv.split("APPROVED BUT NEVER EMAILED")[1].split("⚠ OVERDUE")[0] \
+        if "APPROVED BUT NEVER EMAILED" in inv else ""
+    check("approved-but-never-emailed invoices are named",
+          "INV-1043" in unsent and "INV-1042" not in unsent, inv[-900:])
+    over = inv.split("⚠ OVERDUE")[1] if "⚠ OVERDUE" in inv else ""
+    check("overdue means approved, past due and still owing - never a draft",
+          "INV-1042" in over and "INV-1044" not in over and "INV-1043" not in over, inv[-900:])
+    drafts = s.call("gorelo_list_invoices", status="draft")
+    check("a status filter is sent as StatusIds",
+          "INV-1044" in drafts and "INV-1042" not in drafts
+          and last_query("/v1/invoices").get("StatusIds") == "1", drafts[:400])
+    old = s.call("gorelo_list_invoices", number="INV-0901")
+    check("a number finds an invoice outside the window",
+          "INV-0901" in old and "InvoiceDateSince" not in last_query("/v1/invoices"), old[:400])
+    ce = s.call("gorelo_list_invoices", client="Contoso")
+    check("a client filter is sent as ClientIds",
+          "INV-1043" in ce and "INV-1042" not in ce
+          and last_query("/v1/invoices").get("ClientIds") == "11002", ce[:400])
+    check("no match says so", "No invoices" in s.call("gorelo_list_invoices", number="INV-7777"))
 
     print("\nresponse times")
     rr = s.call("gorelo_response_report", days=400, assignee="anyone", target_minutes=60)
