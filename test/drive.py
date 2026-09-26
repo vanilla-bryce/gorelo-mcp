@@ -33,8 +33,11 @@ ENV.update({
     "GORELO_MY_EMAIL": "sam@example.com",
     "GORELO_ALLOW_WRITES": os.environ.get("WRITES", "false"),
     "HOME": os.path.join(HERE, "_tmp_home"),
+    "GORELO_DOWNLOAD_DIR": os.path.join(HERE, "_tmp_home", "downloads"),
 })
 os.makedirs(ENV["HOME"], exist_ok=True)
+import shutil
+shutil.rmtree(ENV["GORELO_DOWNLOAD_DIR"], ignore_errors=True)
 WRITE_LOG = os.path.join(ENV["HOME"], ".gorelo-mcp-writes.jsonl")
 if os.path.exists(WRITE_LOG):
     os.remove(WRITE_LOG)
@@ -104,7 +107,7 @@ def run_suite():
 
     tools = s.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
     names = [t["name"] for t in tools]
-    check("17 tools advertised", len(tools) == 17, names)
+    check("18 tools advertised", len(tools) == 18, names)
     # There is deliberately no way to DELETE from this server. The strongest
     # form of that is structural: the client has no such method to call.
     lib = os.path.abspath(os.path.join(HERE, "..", "lib", "gorelo.rb"))
@@ -347,6 +350,24 @@ def run_suite():
           "INV-1043" in ce and "INV-1042" not in ce
           and last_query("/v1/invoices").get("ClientIds") == "11002", ce[:400])
     check("no match says so", "No invoices" in s.call("gorelo_list_invoices", number="INV-7777"))
+
+    print("\ninvoice PDF")
+    dl = ENV["GORELO_DOWNLOAD_DIR"]
+    pdf = s.call("gorelo_get_invoice_pdf", invoice="INV-1042")
+    saved = os.path.join(dl, "INV-1042.pdf")
+    check("the PDF is saved under its display number",
+          "Saved INV-1042" in pdf and os.path.isfile(saved)
+          and open(saved, "rb").read(5) == b"%PDF-", pdf)
+    check("the export-event side effect is stated", "export event" in pdf, pdf)
+    evil = s.call("gorelo_get_invoice_pdf", invoice="INV-1045")
+    check("a server-supplied filename cannot choose the directory",
+          os.path.isfile(os.path.join(dl, "evil.pdf"))
+          and not os.path.exists(os.path.join(HERE, "evil.pdf"))
+          and not os.path.exists(os.path.join(ENV["HOME"], "evil.pdf")), evil)
+    check("an unknown number is named",
+          "No invoice numbered" in s.call("gorelo_get_invoice_pdf", invoice="INV-7777"))
+    gone = s.call("gorelo_get_invoice_pdf", invoice="00000000-0000-4000-8000-000000000000")
+    check("an unknown id surfaces Gorelo's 404, not an empty file", "404" in gone, gone)
 
     print("\nresponse times")
     rr = s.call("gorelo_response_report", days=400, assignee="anyone", target_minutes=60)

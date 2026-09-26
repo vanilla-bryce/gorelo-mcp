@@ -101,6 +101,12 @@ module Gorelo
       request(Net::HTTP::Get, path, query: query)
     end
 
+    # A file download. Its ERRORS still arrive as the JSON envelope; its
+    # success is the file itself. Returns Body (binary), ContentType, Filename.
+    def get_binary(path, query = {})
+      request(Net::HTTP::Get, path, query: query, raw: true)
+    end
+
     def post(path, body, query = {})
       guard_writes!
       request(Net::HTTP::Post, path, query: query, body: body)
@@ -324,7 +330,7 @@ module Gorelo
        user['FirstName'], user['LastName'], user['DisplayName']].compact.join(' ').downcase
     end
 
-    def request(klass, path, query: {}, body: nil)
+    def request(klass, path, query: {}, body: nil, raw: false)
       @requests += 1
       uri = URI.join("#{@base_url}/", path.sub(%r{\A/}, ''))
       pairs = query.reject { |_, v| v.nil? || v.to_s.empty? }
@@ -332,7 +338,7 @@ module Gorelo
 
       req = klass.new(uri)
       req['X-API-Key']    = @api_key
-      req['Accept']       = 'application/json'
+      req['Accept']       = raw ? 'application/pdf, application/json' : 'application/json'
       req['User-Agent']   = 'amit-gorelo-mcp/1.0'
       if body
         req['Content-Type'] = 'application/json'
@@ -344,7 +350,7 @@ module Gorelo
       http.open_timeout = 15
       http.read_timeout = 60
 
-      with_retry(path) { handle(http.request(req), uri) }
+      with_retry(path) { handle(http.request(req), uri, raw: raw) }
     rescue Net::OpenTimeout, Net::ReadTimeout => e
       raise Error, "Gorelo timed out calling #{path}: #{e.class}"
     rescue SocketError => e
@@ -370,7 +376,7 @@ module Gorelo
       end
     end
 
-    def handle(res, uri)
+    def handle(res, uri, raw: false)
       code = res.code.to_i
 
       # Auth failures must always surface plainly. Reporting them as "no data"
@@ -378,6 +384,14 @@ module Gorelo
       if [401, 403].include?(code)
         raise AuthError, "Gorelo rejected the API key (HTTP #{code}) on #{uri.path}. " \
                          'Check GORELO_API_KEY and that its scope covers this endpoint.'
+      end
+
+      # A file download succeeds with the file itself - only its errors use the
+      # envelope - so a 2xx that isn't JSON is the answer, not a fault.
+      if raw && code.between?(200, 299) && !res['Content-Type'].to_s.include?('json')
+        return { 'Body'        => res.body.to_s.b,
+                 'ContentType' => res['Content-Type'].to_s,
+                 'Filename'    => res['Content-Disposition'].to_s[/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i, 1] }
       end
 
       parsed = begin
@@ -427,6 +441,8 @@ module Gorelo
       if parsed.key?('IsSuccess') && parsed['IsSuccess'] == false
         raise Error, "Gorelo reported failure for #{uri.path}: #{summarise_notifications(parsed)}"
       end
+
+      raise Error, "Gorelo returned JSON where #{uri.path} should return a file." if raw
 
       parsed
     end

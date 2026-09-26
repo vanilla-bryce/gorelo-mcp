@@ -677,6 +677,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/time-entries/statuses":
             return self.reply(404, fail(404, "No route /v1/time-entries/statuses"))
 
+        m = re.fullmatch(r"/v1/invoices/([^/]+)/pdf", path)
+        if m:
+            hit = next((i for i in INVOICES if i["Id"] == m.group(1)), None)
+            if not hit:
+                return self.reply(404, fail(404, "Invoice not found"))
+            # Void INV-1045 carries a hostile filename, to prove the server never
+            # lets Content-Disposition choose the directory.
+            name = "../../evil.pdf" if hit["Number"] == 1045 else hit["DisplayNumber"] + ".pdf"
+            body = b"%PDF-1.4\n% fake invoice " + hit["DisplayNumber"].encode() + b"\n%%EOF\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Disposition", 'attachment; filename="%s"' % name)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if path == "/v1/invoices":
             if page_too_big(q):
                 return self.reply(400, fail(400, "PageSize must be 1-200"))

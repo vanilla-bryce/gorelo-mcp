@@ -26,9 +26,11 @@ module GoreloBillingTools
   STATUS_DRAFT    = 1
   STATUS_APPROVED = 5
   FLAG_LIST_MAX   = 25
+  GUID = Gorelo::Client::GUID
 
   def register(server, api)
     list_invoices(server, api)
+    get_invoice_pdf(server, api)
   end
 
   # ---- invoices -----------------------------------------------------------
@@ -153,6 +155,79 @@ module GoreloBillingTools
         end
         out << "  … #{overdue.size - FLAG_LIST_MAX} more" if overdue.size > FLAG_LIST_MAX
       end
+      out.join("\n")
+    end
+  end
+
+  # Where PDFs land. Under WSL this is a Linux path; Windows reaches it as
+  # \\wsl$\<distro>\<path>.
+  def download_dir = File.expand_path(ENV['GORELO_DOWNLOAD_DIR'] || '~/gorelo-invoices')
+
+  # "INV-1042", "1042" or an invoice UUID -> [row, nil] or [nil, why]. A number
+  # costs one filtered request; a UUID costs none (the row then holds only Id).
+  def find_invoice(api, ref)
+    ref = ref.to_s.strip
+    return [{ 'Id' => ref }, nil] if ref.match?(GUID)
+
+    num = ref.sub(/\AINV-?/i, '')
+    return [nil, "#{ref.inspect} is not an invoice number or id."] unless num.match?(/\A\d+\z/)
+
+    row = Array(api.get('/v1/invoices', { 'Number' => num.to_i })['Data']).first
+    row ? [row, nil] : [nil, "No invoice numbered #{num.to_i}."]
+  end
+
+  def get_invoice_pdf(server, api)
+    server.tool(
+      name:  'gorelo_get_invoice_pdf',
+      title: 'Download a Gorelo invoice as PDF',
+      description: <<~TEXT,
+        Saves an invoice's PDF to a folder on the machine running this server and returns the
+        path. The file itself never passes through the conversation.
+
+        Gorelo renders the PDF on demand from the invoice's CURRENT data, and RECORDS EACH
+        DOWNLOAD AGAINST THE INVOICE AS AN EXPORT EVENT - so this read leaves a visible trace
+        in Gorelo. Don't download an invoice just to read its figures; gorelo_list_invoices
+        has them.
+
+        Folder: GORELO_DOWNLOAD_DIR, default ~/gorelo-invoices. A file of the same name is
+        replaced.
+      TEXT
+      input_schema: {
+        type: 'object',
+        properties: {
+          invoice: { type: 'string', description: 'Invoice number (INV-1042 or 1042) or invoice id.' }
+        },
+        required: ['invoice'],
+        additionalProperties: false
+      }
+    ) do |args|
+      row, why = find_invoice(api, args['invoice'])
+      next why unless row
+
+      file = api.get_binary("/v1/invoices/#{row['Id']}/pdf")
+      body = file['Body']
+      unless body.start_with?('%PDF-')
+        next "Gorelo answered with #{file['ContentType']}, but the body is not a PDF. Nothing was saved."
+      end
+
+      # The server suggests a name; it never chooses the directory.
+      name = File.basename(file['Filename'].to_s.tr('\\', '/'))
+      name = "#{row['DisplayNumber'] || row['Id']}.pdf" if name.empty? || name.start_with?('.')
+      name = name.gsub(/[^\w.\-]/, '_')
+      name += '.pdf' unless name.downcase.end_with?('.pdf')
+
+      FileUtils.mkdir_p(download_dir)
+      path     = File.join(download_dir, name)
+      replaced = File.exist?(path)
+      File.binwrite(path, body)
+
+      out = ["Saved #{row['DisplayNumber'] || row['Id']} to #{path} (#{body.bytesize} bytes)" \
+             "#{replaced ? ', replacing an earlier copy' : ''}."]
+      if row['ClientId']
+        out << "#{api.client_name(row['ClientId'])} · #{nested(row, 'Status', 'Name')} · " \
+               "total #{money(row['Total'])}"
+      end
+      out << 'Gorelo has recorded this download as an export event on the invoice.'
       out.join("\n")
     end
   end
