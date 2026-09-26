@@ -89,6 +89,13 @@ def te_query():
     return last_query("/v1/time-entries")
 
 
+def last_body(path):
+    """The JSON body the mock last received for a POST or PATCH on `path`."""
+    url = ENV["GORELO_BASE_URL"] + "/__debug/last-body?" + urllib.parse.urlencode({"path": path})
+    with urllib.request.urlopen(url) as r:
+        return json.load(r)
+
+
 PASS, FAIL = 0, 0
 
 
@@ -107,7 +114,7 @@ def run_suite():
 
     tools = s.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
     names = [t["name"] for t in tools]
-    check("21 tools advertised", len(tools) == 21, names)
+    check("22 tools advertised", len(tools) == 22, names)
     # There is deliberately no way to DELETE from this server. The strongest
     # form of that is structural: the client has no such method to call.
     lib = os.path.abspath(os.path.join(HERE, "..", "lib", "gorelo.rb"))
@@ -119,9 +126,10 @@ def run_suite():
     check("no tool takes an HTTP method or verb",
           not any(k in ("method", "verb", "http_method")
                   for t in tools for k in t["inputSchema"].get("properties", {})))
-    check("exactly two tools write, and neither can delete",
+    check("exactly three tools write, and none can delete",
           sorted(t["name"] for t in tools if not t["annotations"]["readOnlyHint"])
-          == ["gorelo_add_ticket_comment", "gorelo_update_ticket"])
+          == ["gorelo_add_ticket_comment", "gorelo_set_uptime_maintenance",
+              "gorelo_update_ticket"])
 
     print("\ncounting")
     everything = s.call("gorelo_list_tickets", status="all", limit=300)
@@ -469,6 +477,9 @@ def run_suite():
     check("update_ticket refused when disabled",
           "Writes are disabled" in s.call("gorelo_update_ticket",
                                           ticket="G-1000", status="Closed", confirm=True))
+    check("uptime maintenance refused when disabled",
+          "Writes are disabled" in s.call("gorelo_set_uptime_maintenance", check="head office",
+                                          action="start", minutes=60, reason="x", confirm=True))
 
     print("\nprobe")
     # The 2026-08-21 release added DELETE endpoints for tickets, clients,
@@ -551,6 +562,48 @@ def run_suite():
     check("and it names the likely cause and the payload sent",
           "field name in the PATCH payload is wrong" in silent and "StatusId" in silent,
           silent[:600])
+
+    print("\nuptime maintenance")
+    U = "/v1/uptime/0b700000-0000-4000-8000-000000000001"
+    check("confirm required", "confirm must be true" in
+          s2.call("gorelo_set_uptime_maintenance", check="head office", action="start",
+                  minutes=60, reason="x", confirm=False))
+    check("a reason is required to start", "reason is required" in
+          s2.call("gorelo_set_uptime_maintenance", check="head office", action="start",
+                  minutes=60, confirm=True))
+    b0 = last_body(U)
+    zero = s2.call("gorelo_set_uptime_maintenance", check="head office", action="start",
+                   minutes=0, reason="Router swap", confirm=True)
+    check("zero minutes is refused - a never-ending window must be asked for by name",
+          "indefinite: true" in zero and last_body(U) == b0, zero)
+    amb = s2.call("gorelo_set_uptime_maintenance", check="-", action="end", confirm=True)
+    check("a fragment matching several checks is refused, never guessed",
+          "uptime checks match" in amb and last_body(U) == b0, amb)
+    started = s2.call("gorelo_set_uptime_maintenance", check="head office", action="start",
+                      minutes=60, reason="Router swap", confirm=True)
+    sent = last_body(U)
+    check("start is applied and verified by reading back",
+          "Started maintenance" in started and "Verified" in started, started)
+    check("only MaintenanceMode is sent", list(sent) == ["MaintenanceMode"], sent)
+    check("the reason is attributed, since the API records no author",
+          sent.get("MaintenanceMode", {}).get("Reason") == "[Gorelo MCP] Router swap", sent)
+    check("the list now shows it in maintenance",
+          "Router swap" in s2.call("gorelo_list_uptime", query="head office"))
+    ended = s2.call("gorelo_set_uptime_maintenance", check="head office", action="end", confirm=True)
+    check("end sends Enabled:false and nothing else",
+          last_body(U) == {"MaintenanceMode": {"Enabled": False}} and "Ended maintenance" in ended,
+          (ended, last_body(U)))
+    check("ending a check that is not in maintenance writes nothing", "not in maintenance" in
+          s2.call("gorelo_set_uptime_maintenance", check="head office", action="end", confirm=True))
+    forever = s2.call("gorelo_set_uptime_maintenance", check="head office", action="start",
+                      indefinite=True, reason="Awaiting decommission", confirm=True)
+    check("indefinite sends a zero duration and says loudly that it never expires",
+          last_body(U).get("MaintenanceMode", {}).get("DurationInMinutes") == 0
+          and "NEVER EXPIRES" in forever, forever)
+    s2.call("gorelo_set_uptime_maintenance", check="head office", action="end", confirm=True)
+    ignored = s2.call("gorelo_set_uptime_maintenance", check="Tailspin", action="end", confirm=True)
+    check("an accepted-but-ignored change is reported as FAILED",
+          "DID NOT TAKE EFFECT" in ignored, ignored)
     s2.close()
     ENV["GORELO_ALLOW_WRITES"] = "false"
 

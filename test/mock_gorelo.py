@@ -51,6 +51,9 @@ NOW = datetime.now(timezone.utc)
 # names a tool actually sends. Read it at /__debug/last-query?path=<path>.
 LAST_QUERY = {}
 
+# The JSON body each POST/PATCH path last received: /__debug/last-body?path=<path>.
+LAST_BODY = {}
+
 
 def ago(days, hours=0):
     return (NOW - timedelta(days=days, hours=hours)).isoformat().replace("+00:00", "Z")
@@ -736,6 +739,10 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         path = urlparse(self.path).path
+        LAST_BODY[path] = body
+        m = re.fullmatch(r"/v1/uptime/([^/]+)", path)
+        if m:
+            return self.patch_uptime(m.group(1), body)
         m = re.fullmatch(r"/v1/tickets/([^/]+)", path)
         if not m:
             return self.reply(404, fail(404, "Not found"))
@@ -762,12 +769,40 @@ class Handler(BaseHTTPRequestHandler):
                 hit["Status"] = {"Id": st["Id"], "Name": st["Name"]}
         return self.reply(200, env(hit))
 
+    def patch_uptime(self, check_id, body):
+        hit = next((c for c in UPTIME if c["Id"] == check_id), None)
+        if not hit:
+            return self.reply(404, fail(404, "Uptime check not found"))
+        if not body:
+            return self.reply(400, fail(400, "Nothing to update"))
+        # This server has no business sending anything else, so the suite fails
+        # if the tool's scope ever widens quietly.
+        extra = set(body) - {"MaintenanceMode"}
+        if extra:
+            return self.reply(400, fail(400, "Unexpected fields: %s" % ", ".join(sorted(extra))))
+        mm = body["MaintenanceMode"]
+        unknown = set(mm) - {"Enabled", "StartDateTime", "DurationInMinutes", "Reason"}
+        if unknown:
+            return self.reply(400, fail(400, "Unknown MaintenanceMode fields: %s" % sorted(unknown)))
+        if mm.get("Enabled") and (mm.get("StartDateTime") is None
+                                  or mm.get("DurationInMinutes") is None or not mm.get("Reason")):
+            return self.reply(400, fail(400, "Starting maintenance needs a start, a duration and a reason"))
+        # Tailspin's check accepts the PATCH and IGNORES it, standing in for a
+        # payload the API took and did not apply. Only a read-back catches that.
+        if not hit["Description"].startswith("Tailspin"):
+            hit["MaintenanceMode"] = (
+                {k: mm.get(k) for k in ("Enabled", "StartDateTime", "DurationInMinutes", "Reason")}
+                if mm.get("Enabled") else dict(NO_WINDOW))
+        return self.reply(200, env({"Id": check_id}))
+
     def do_GET(self):
         d = urlparse(self.path)
         if d.path.startswith("/__debug/"):
             want = parse_qs(d.query).get("path", [""])[0]
             if d.path == "/__debug/last-query":
                 return self.reply(200, LAST_QUERY.get(want, {}))
+            if d.path == "/__debug/last-body":
+                return self.reply(200, LAST_BODY.get(want, {}))
             return self.reply(404, fail(404, "No debug route %s" % d.path))
         if not self.authorised():
             return
