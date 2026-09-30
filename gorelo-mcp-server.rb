@@ -10,7 +10,7 @@
 #   GORELO_API_KEY       required
 #   GORELO_MY_EMAIL      required for assignee "me"
 #   GORELO_BASE_URL      default https://api.aue.gorelo.io
-#   GORELO_ALLOW_WRITES  "true" enables the four write tools. Default off.
+#   GORELO_ALLOW_WRITES  "true" enables the six write tools. Default off.
 #   GORELO_DOWNLOAD_DIR  where invoice PDFs are saved. Default ~/gorelo-invoices
 #   GORELO_ATTACH_DIR    the ONLY folder comment attachments come from.
 #                        Default ~/gorelo-attachments
@@ -22,6 +22,7 @@ require_relative 'lib/gorelo'
 require_relative 'lib/gorelo_tools'
 require_relative 'lib/gorelo_billing_tools'
 require_relative 'lib/gorelo_uptime_tools'
+require_relative 'lib/gorelo_time_entry_tools'
 
 VERSION = '1.1.0'
 
@@ -70,9 +71,16 @@ server = McpStdio::Server.new(
     system and is left to a person in Gorelo. Downloading an invoice PDF is recorded by
     Gorelo as an export event on that invoice, so do not download one just to read it.
 
-    Four tools write - gorelo_add_ticket_comment, gorelo_update_ticket,
-    gorelo_set_uptime_maintenance and gorelo_create_draft_invoice - and all are off
-    unless explicitly enabled. Nothing here can delete anything.
+    Six tools write - gorelo_add_ticket_comment, gorelo_update_ticket,
+    gorelo_set_uptime_maintenance, gorelo_create_draft_invoice, gorelo_update_time_entry
+    and gorelo_update_time_entries - and all are off unless explicitly enabled. Nothing
+    here can delete anything.
+
+    RECODING TIME. gorelo_update_time_entry (and its batch form) changes only a time entry's
+    work type, billable status, service line and comment - never hours, dates, technician or
+    ticket. Without confirm: true it only previews. Gorelo RE-PRICES an entry whenever work
+    type, billable status or service line changes and moves contract hours between contracts,
+    so always show the preview to the person and get their approval before confirming.
   TEXT
 )
 
@@ -94,4 +102,5 @@ server.log("base_url=#{api.base_url} writes=#{api.writes_allowed? ? 'ENABLED' : 
 GoreloTools.register(server, api)
 GoreloBillingTools.register(server, api)
 GoreloUptimeTools.register(server, api)
+GoreloTimeEntryTools.register(server, api)
 server.run

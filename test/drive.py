@@ -134,7 +134,7 @@ def run_suite():
 
     tools = s.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
     names = [t["name"] for t in tools]
-    check("23 tools advertised", len(tools) == 23, names)
+    check("25 tools advertised", len(tools) == 25, names)
     # There is deliberately no way to DELETE from this server. The strongest
     # form of that is structural: the client has no such method to call.
     lib = os.path.abspath(os.path.join(HERE, "..", "lib", "gorelo.rb"))
@@ -146,10 +146,16 @@ def run_suite():
     check("no tool takes an HTTP method or verb",
           not any(k in ("method", "verb", "http_method")
                   for t in tools for k in t["inputSchema"].get("properties", {})))
-    check("exactly four tools write, and none can delete",
+    check("exactly six tools write, and none can delete",
           sorted(t["name"] for t in tools if not t["annotations"]["readOnlyHint"])
           == ["gorelo_add_ticket_comment", "gorelo_create_draft_invoice",
-              "gorelo_set_uptime_maintenance", "gorelo_update_ticket"])
+              "gorelo_set_uptime_maintenance", "gorelo_update_ticket",
+              "gorelo_update_time_entries", "gorelo_update_time_entry"])
+    te_props = next(t for t in tools if t["name"] == "gorelo_update_time_entry")["inputSchema"]["properties"]
+    check("the time entry tool exposes no hours, dates, user, role or ticket",
+          sorted(te_props) == ["append_comment", "billable_status", "comment", "confirm",
+                               "expected_updated_on", "id", "service_line_id", "work_type"],
+          sorted(te_props))
     inv_props = next((t for t in tools if t["name"] == "gorelo_create_draft_invoice"),
                      {"inputSchema": {"properties": {"status": 1}}})["inputSchema"]["properties"]
     check("a draft invoice has no status parameter - approving stays a human action",
@@ -596,6 +602,17 @@ def run_suite():
 
     stderr = s.close()
 
+    s0 = Server()  # writes still disabled
+    dis = s0.call("gorelo_update_time_entry", id=880001, work_type="Peer Assist", confirm=True)
+    check("time entry update refused when writes are disabled",
+          "Writes are disabled" in dis and hits("/v1/time-entries/880001") == 0, dis)
+    check("time entry preview also refused when writes are disabled",
+          "Writes are disabled" in s0.call("gorelo_update_time_entry", id=880001, work_type="Peer Assist"))
+    check("batch time entry update refused when writes are disabled",
+          "Writes are disabled" in s0.call("gorelo_update_time_entries",
+                                           entries=[{"id": 880001, "work_type": "Peer Assist"}], confirm=True))
+    s0.close()
+
     print("\nwrites ENABLED")
     ENV["GORELO_ALLOW_WRITES"] = "true"
     s2 = Server()
@@ -871,6 +888,82 @@ def run_suite():
     check("more than 10 files is refused", "at most 10 files" in
           s2.call("gorelo_add_ticket_comment", ticket="G-1000", body="Too many.",
                   files=["notes.txt"] + ["x%d.txt" % i for i in range(10)], confirm=True))
+
+    print("\ntime entry updates")
+    E1 = "/v1/time-entries/880001"
+    prev = s2.call("gorelo_update_time_entry", id=880001, work_type="Peer Assist",
+                   billable_status="No charge")
+    check("preview shows ticket, Brisbane date, tech, hours and current -> new",
+          "PREVIEW ONLY" in prev and "G-1000" in prev and "Alex Kim" in prev and "1.00h" in prev
+          and "Wed 30 Sep 2026 00:30 AEST" in prev
+          and "Remote Support → Peer Assist" in prev and "Billable → No charge" in prev, prev)
+    check("preview warns about re-pricing and prints expected_updated_on",
+          "RE-PRICES" in prev and "expected_updated_on: 2026-09-30T01:00:00Z" in prev, prev)
+    check("preview makes no PATCH", hits(E1) == 0, hits(E1))
+    check("an unchanged value is not previewed as a change",
+          "No change" in s2.call("gorelo_update_time_entry", id=880001, work_type="Remote Support"))
+    for label, args in [("hours", {"hours": 2}), ("started_on", {"started_on": "2026-01-01"}),
+                        ("user", {"user": "Sam"}), ("billing_role", {"billing_role": "Project Consultant"}),
+                        ("ticket", {"ticket": "G-1000"}), ("TicketId", {"TicketId": "x"})]:
+        r = s2.call("gorelo_update_time_entry", id=880001, work_type="Peer Assist", confirm=True, **args)
+        check("disallowed key %s is refused with nothing written" % label,
+              "Refused" in r and label in r and hits(E1) == 0, r)
+    check("nothing to change is refused", "Nothing to do" in s2.call("gorelo_update_time_entry", id=880001, confirm=True))
+    check("a non-numeric id is refused", "must be a time entry id" in
+          s2.call("gorelo_update_time_entry", id="te-00001", work_type="Peer Assist", confirm=True))
+    check("an unknown entry is reported", "No time entry 424242" in
+          s2.call("gorelo_update_time_entry", id=424242, work_type="Peer Assist"))
+    check("an unknown work type lists the available ones", "Available" in
+          s2.call("gorelo_update_time_entry", id=880001, work_type="Nonsense"))
+    check("an unknown billable status is refused", "No billable status matches" in
+          s2.call("gorelo_update_time_entry", id=880001, billable_status="Free"))
+    stale = s2.call("gorelo_update_time_entry", id=880001, work_type="Peer Assist", confirm=True,
+                    expected_updated_on="2026-09-30T00:00:00Z")
+    check("an expected_updated_on mismatch refuses and writes nothing",
+          "changed since the preview" in stale and hits(E1) == 0, stale)
+    both = s2.call("gorelo_update_time_entry", id=880001, comment="a", append_comment="b", confirm=True)
+    check("comment and append_comment together are refused", "not both" in both and hits(E1) == 0, both)
+    done = s2.call("gorelo_update_time_entry", id=880001, work_type="peer assist",
+                   billable_status="no charge", confirm=True,
+                   expected_updated_on="2026-09-30T01:00:00Z")
+    check("confirm PATCHes once, with only the changed fields, resolving the name Peer Assist",
+          hits(E1) == 1 and last_body(E1) == {"WorkTypeId": 6, "BillableStatusId": 2}, last_body(E1))
+    check("the returned entry's new values are printed",
+          "Updated." in done and "work type:       Peer Assist" in done
+          and "billable status: No charge" in done and "2026-10-01T02:00:00Z" in done, done)
+    again = s2.call("gorelo_update_time_entry", id=880001, work_type="Peer Assist", confirm=True)
+    check("confirming an already-applied change sends nothing", "No change" in again and hits(E1) == 1, again)
+    sl = s2.call("gorelo_update_time_entry", id=880001, service_line_id=9010, append_comment="Recoded to fixed labour.", confirm=True)
+    check("service line and appended comment: only those fields sent",
+          last_body(E1) == {"ServiceLineId": 9010, "Comment": "Assisted Sam with the switch.\nRecoded to fixed labour."}
+          and "Offsite Backup - 2 TB" in sl, (last_body(E1), sl))
+    E2 = "/v1/time-entries/880002"
+    s2.call("gorelo_update_time_entry", id=880002, append_comment="Recoded <ok>", confirm=True)
+    check("an HTML comment is appended as an escaped paragraph",
+          last_body(E2) == {"Comment": "<p>Assisted Sam on site.</p><p>Recoded &lt;ok&gt;</p>"}, last_body(E2))
+    inv = s2.call("gorelo_update_time_entry", id=880003, work_type="Peer Assist", confirm=True)
+    check("Gorelo's 409 on an invoiced entry is reported, not hidden",
+          "refused" in inv and "cannot be changed" in inv, inv)
+    check("a WORKED write is in the audit log",
+          "/v1/time-entries/880001" in open(WRITE_LOG).read())
+
+    print("\nbatch time entry updates")
+    E3 = "/v1/time-entries/880003"
+    bp = s2.call("gorelo_update_time_entries", entries=[
+        {"id": 880002, "work_type": "Peer Assist"}, {"id": 880001, "billable_status": "Void"}])
+    check("batch preview lists every entry and writes nothing",
+          "PREVIEW ONLY" in bp and "880002" in bp and "880001" in bp and hits(E2) == 1, bp)
+    bad = s2.call("gorelo_update_time_entries", confirm=True, entries=[
+        {"id": 880002, "work_type": "Peer Assist"}, {"id": 880001, "hours": 3}])
+    check("one invalid entry refuses the whole batch", "nothing was written" in bad and hits(E2) == 1, bad)
+    stop = s2.call("gorelo_update_time_entries", confirm=True, entries=[
+        {"id": 880002, "work_type": "Peer Assist"}, {"id": 880003, "work_type": "Peer Assist"},
+        {"id": 880001, "billable_status": "Void"}])
+    check("batch applies in order and stops at the first error",
+          "STOPPED at entry 880003" in stop and "Applied before it: 880002" in stop
+          and "Not attempted: 880001" in stop and hits(E2) == 2 and hits(E3) == 2, stop)
+    okb = s2.call("gorelo_update_time_entries", confirm=True, entries=[{"id": 880001, "billable_status": "Void"}])
+    check("a clean batch reports what it applied", "Applied all 1 entry: 880001" in okb, okb)
     s2.close()
     ENV["GORELO_ALLOW_WRITES"] = "false"
 

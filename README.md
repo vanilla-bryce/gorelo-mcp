@@ -136,10 +136,10 @@ Restart your MCP client. Then ask it something like *"list my open Gorelo ticket
 
 | Variable | |
 |---|---|
-| `GORELO_API_KEY` | **Required.** Make it read-only to start with — only four tools write. |
+| `GORELO_API_KEY` | **Required.** Make it read-only to start with — only six tools write. |
 | `GORELO_MY_EMAIL` | **Required** for `assignee: "me"`. Must match your Gorelo user exactly. |
 | `GORELO_BASE_URL` | Defaults to `https://api.aue.gorelo.io`. Change for other regions. |
-| `GORELO_ALLOW_WRITES` | `true` enables the four write tools. Off by default. |
+| `GORELO_ALLOW_WRITES` | `true` enables the six write tools. Off by default. |
 | `GORELO_DOWNLOAD_DIR` | Where `gorelo_get_invoice_pdf` saves PDFs. Defaults to `~/gorelo-invoices`. |
 | `GORELO_ATTACH_DIR` | The **only** folder comment attachments can come from. Defaults to `~/gorelo-attachments`. |
 
@@ -171,6 +171,8 @@ Restart your MCP client. Then ask it something like *"list my open Gorelo ticket
 | `gorelo_update_ticket` | **yes** | Sets a ticket's client or status — nothing else. Off by default. |
 | `gorelo_set_uptime_maintenance` | **yes** | Starts or ends a maintenance window on one check — nothing else. Off by default. |
 | `gorelo_create_draft_invoice` | **yes** | Raises a manual invoice, always as a Draft. Off by default. |
+| `gorelo_update_time_entry` | **yes** | Recodes one time entry's work type, billable status, service line or comment — nothing else. Previews unless `confirm: true`. Gorelo **re-prices** the entry. Off by default. |
+| `gorelo_update_time_entries` | **yes** | The batch form: previews up to 50 entries as one list, then applies them one by one and stops at the first error. Off by default. |
 | `gorelo_api_probe` | | Raw `GET` on any `/v1/…` path, for exploring |
 
 ### The write tools
@@ -195,6 +197,30 @@ The request body is `CreatePublicCommentCommand`: `ConversationTypeId`, `Body`,
 `CreatedByName`, `Attachments`. `ConversationId` is **rejected** for Public and Private and is
 never sent. The test mock enforces all of that — it rejects unknown fields — so the suite
 fails if the payload drifts from the documented schema.
+
+#### `gorelo_update_time_entry` and `gorelo_update_time_entries`
+
+`PATCH /v1/time-entries/{id}`. Sends only `WorkTypeId`, `BillableStatusId`, `ServiceLineId` and
+`Comment`. Hours, dates, technician, billing role and ticket are not reachable, and any other
+argument is refused rather than ignored.
+
+- **No `confirm: true`: preview only.** The entry is read and shown with its ticket, date
+  (Brisbane time), technician and hours, and each field as current → new. Nothing is written.
+  The preview prints `expected_updated_on`.
+- **`confirm: true`:** the entry is read again, the write is refused if a supplied
+  `expected_updated_on` no longer matches, only the fields that differ are sent, and the
+  values Gorelo returns are printed.
+- **Gorelo re-prices the entry** when work type, billable status or service line changes: the
+  work type's minimum and increment, the role's rate and the contract's terms are re-applied
+  and hours move between BlockHours / LimitedHours contracts. Approved, completed, invoiced
+  and void entries are refused by Gorelo (409).
+- `work_type` is a name or id matched against the live work types (`"Peer Assist"`).
+  `billable_status` is Billable, Non-billable, No charge or Void: there is no endpoint that
+  lists them, so the four values seen on real entries are built in.
+- `service_line_id` is the API ServiceLine, which the UI calls a Contract.
+- The batch tool refuses the whole batch if any entry is invalid, applies entries about one per
+  second and stops at the first error, reporting what was and was not applied.
+- Every applied change is written to `~/.gorelo-mcp-writes.jsonl`.
 
 #### `gorelo_update_ticket`
 

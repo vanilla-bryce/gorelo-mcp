@@ -156,8 +156,10 @@ module Gorelo
                                      content_type: "multipart/form-data; boundary=#{boundary}")
     end
 
-    # PATCH exists for tickets, clients and contacts. Only tickets are reachable
-    # from this server, and only two fields on them - see gorelo_update_ticket.
+    # PATCH exists for tickets, clients, contacts and time entries. Only tickets
+    # (two fields - see gorelo_update_ticket), uptime checks and time entries
+    # (work type, billable status, service line, comment - see
+    # gorelo_update_time_entry) are reachable from this server.
     #
     # There is deliberately NO `delete` method on this class. Gorelo now exposes
     # DELETE for tickets, clients, contacts, agent assets, custom assets,

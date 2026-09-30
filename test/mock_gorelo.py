@@ -337,6 +337,10 @@ WORK_TYPES = [
      "IsDefaultOutsideBusinessHours": False,
      "BillableStatus": {"Id": 2, "Name": "Not Billable"},
      "CoaCode": "", "Tax": "", "MinimumTimeInMinutes": 0},
+    {"Id": 6, "Name": "Peer Assist", "HourlyMultiplier": 1.0,
+     "IsDefaultOutsideBusinessHours": False,
+     "BillableStatus": {"Id": 2, "Name": "No charge"},
+     "CoaCode": "", "Tax": "", "MinimumTimeInMinutes": 0},
 ]
 
 CONTRACTS = [
@@ -413,6 +417,44 @@ def add_entry(ticket, user, actual, adjusted, billable, work_type, role,
 
 
 _t_by_number = {t["Number"]: t for t in TICKETS}
+
+# --- time entries that PATCH /v1/time-entries/{id} may change --------------
+# Kept apart from TIME_ENTRIES so the report totals above stay exact. Real ids
+# are int64, unlike the "te-nnnnn" strings above. The billable statuses here
+# are the REAL ones (1 Billable, 2 No charge, 3 Non-billable, 5 Void); the
+# older fixtures use their own ids and are never sent to this endpoint.
+REAL_BILLABLE = {1: "Billable", 2: "No charge", 3: "Non-billable", 5: "Void"}
+PATCHABLE_ENTRIES = {}
+
+
+def add_patchable(entry_id, user, hours, comment, status="open"):
+    t = _t_by_number[1000]
+    started = NOW - timedelta(days=5, hours=3)
+    PATCHABLE_ENTRIES[entry_id] = {
+        "Id": entry_id,
+        "Ticket": {"Id": t["Id"], "Number": t["Number"], "Title": t["Title"]},
+        "Task": None, "User": {"Id": user, "Name": USER_NAMES[user]},
+        # 14:30 UTC is 00:30 the next day in Brisbane: the preview must convert.
+        "StartedOn": "2026-09-29T14:30:00Z", "EndedOn": "2026-09-29T15:30:00Z",
+        "ActualHours": hours, "AdjustedHours": hours,
+        "BillableStatus": {"Id": 1, "Name": "Billable"},
+        "BillingRole": {"Id": 1, "Name": "Service Desk Engineer"},
+        "WorkType": {"Id": 1, "Name": "Remote Support"},
+        "ServiceLine": {"Id": 9001, "Name": "Managed Desktop - 42 seats"},
+        "Comment": comment, "Distance": 0, "Attachments": [],
+        "CreatedOn": "2026-09-29T15:31:00Z", "UpdatedOn": "2026-09-30T01:00:00Z",
+        "_status": status,
+    }
+
+
+add_patchable(880001, OTHER, 1.0, "Assisted Sam with the switch.")
+add_patchable(880002, OTHER, 0.5, "<p>Assisted Sam on site.</p>")
+add_patchable(880003, ME, 2.0, "Already invoiced.", status="invoiced")
+
+
+def public_entry(e):
+    return {k: v for k, v in e.items() if not k.startswith("_")}
+
 
 # THE CASE THE OLD REPORT GOT WRONG. G-1000 is led by ME, and OTHER logged time
 # on it while assisting. Attributing a ticket's hours to its lead assignee - the
@@ -771,9 +813,13 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         path = urlparse(self.path).path
         LAST_BODY[path] = body
+        HITS[path] = HITS.get(path, 0) + 1
         m = re.fullmatch(r"/v1/uptime/([^/]+)", path)
         if m:
             return self.patch_uptime(m.group(1), body)
+        m = re.fullmatch(r"/v1/time-entries/(\d+)", path)
+        if m:
+            return self.patch_time_entry(int(m.group(1)), body)
         m = re.fullmatch(r"/v1/tickets/([^/]+)", path)
         if not m:
             return self.reply(404, fail(404, "Not found"))
@@ -799,6 +845,52 @@ class Handler(BaseHTTPRequestHandler):
             if st:
                 hit["Status"] = {"Id": st["Id"], "Name": st["Name"]}
         return self.reply(200, env(hit))
+
+    def patch_time_entry(self, entry_id, body):
+        if not self.authorised():
+            return
+        hit = PATCHABLE_ENTRIES.get(entry_id)
+        if not hit:
+            return self.reply(404, fail(404, "Time entry not found"))
+        # As documented: only these are accepted here (the real endpoint takes
+        # more, but this server must never send them); anything else, including
+        # TicketId and Attachments, is a 400.
+        allowed = {"WorkTypeId", "BillableStatusId", "ServiceLineId", "Comment"}
+        extra = set(body) - allowed
+        if extra:
+            return self.reply(400, fail(400, "Unexpected fields: %s" % ", ".join(sorted(extra))))
+        if hit["_status"] != "open":
+            return self.reply(409, fail(409, "Time entry is %s and cannot be changed" % hit["_status"]))
+        changed = False
+        if "WorkTypeId" in body:
+            wt = next((w for w in WORK_TYPES if w["Id"] == body["WorkTypeId"]), None)
+            if not wt:
+                return self.reply(400, fail(400, "Unknown WorkTypeId"))
+            if hit["WorkType"]["Id"] != wt["Id"]:
+                hit["WorkType"] = {"Id": wt["Id"], "Name": wt["Name"]}
+                changed = True
+        if "BillableStatusId" in body:
+            if body["BillableStatusId"] not in REAL_BILLABLE:
+                return self.reply(400, fail(400, "Unknown BillableStatusId"))
+            if hit["BillableStatus"]["Id"] != body["BillableStatusId"]:
+                hit["BillableStatus"] = {"Id": body["BillableStatusId"],
+                                         "Name": REAL_BILLABLE[body["BillableStatusId"]]}
+                changed = True
+        if "ServiceLineId" in body:
+            names = {sl["Id"]: sl["Name"] for c in CONTRACTS for sl in c["ServiceLines"]}
+            if body["ServiceLineId"] not in names:
+                return self.reply(400, fail(400, "Unknown ServiceLineId"))
+            if hit["ServiceLine"]["Id"] != body["ServiceLineId"]:
+                hit["ServiceLine"] = {"Id": body["ServiceLineId"], "Name": names[body["ServiceLineId"]]}
+                changed = True
+        if "Comment" in body and body["Comment"] != hit["Comment"]:
+            hit["Comment"] = body["Comment"]
+            changed = True
+        if changed:
+            # Re-pricing: a No charge / Void entry is worth nothing, and a
+            # work type with a minimum lifts short entries to it.
+            hit["UpdatedOn"] = "2026-10-01T02:00:00Z"
+        return self.reply(200, env(public_entry(hit)))
 
     def patch_uptime(self, check_id, body):
         hit = next((c for c in UPTIME if c["Id"] == check_id), None)
@@ -991,6 +1083,13 @@ class Handler(BaseHTTPRequestHandler):
             rows = sorted(rows, key=lambda i: i["InvoiceDate"], reverse=True)
             rows, pag = paginate(rows, q)
             return self.reply(200, env(rows, pag))
+
+        m = re.fullmatch(r"/v1/time-entries/(\d+)", path)
+        if m:
+            hit = PATCHABLE_ENTRIES.get(int(m.group(1)))
+            if not hit:
+                return self.reply(404, fail(404, "Time entry not found"))
+            return self.reply(200, env(public_entry(hit)))
 
         if path == "/v1/time-entries":
             # Honours the documented filters and IGNORES every other name,
