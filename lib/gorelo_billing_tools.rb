@@ -575,16 +575,7 @@ module GoreloBillingTools
   # ---- draft invoices (write) ---------------------------------------------
 
   # A write needs exactly one client; a read can take several.
-  def one_client(api, term)
-    matched = api.resolve_clients(term)
-    return [nil, "No client matches #{term.inspect}."] if matched.empty?
-    if matched.size > 1
-      return [nil, "#{matched.size} clients match #{term.inspect}: " \
-                   "#{matched.first(8).map { |c| "#{c['Id']} #{c['Name']}" }.join(', ')}. Narrow it."]
-    end
-
-    [matched.first, nil]
-  end
+  def one_client(api, term, did = 'created') = GoreloTools.write_client(api, term, did)
 
   def parse_day(value, label)
     return [nil, nil] if value.nil? || value.to_s.strip.empty?
@@ -734,24 +725,31 @@ module GoreloBillingTools
 
       # Read back by id. A failed read is reported, never retried: the POST has
       # already succeeded and must not be repeated on the strength of it.
+      read_error = nil
       row = begin
         api.get("/v1/invoices/#{id}")['Data']
-      rescue Gorelo::Error
+      rescue Gorelo::Error => e
+        read_error = e.message
         nil
       end
       unless row.is_a?(Hash)
-        next "⚠ Gorelo returned invoice id #{id} for #{client['Name']}, but it could NOT be read back. " \
+        next "⚠ Gorelo returned invoice id #{id} for #{GoreloTools.client_label(client)}, but it could NOT be read back " \
+             "(#{read_error || 'no invoice in the reply'}). " \
              'Check in Gorelo before assuming it exists, or raising it again.'
       end
 
       draft = nested(row, 'Status', 'Id') == STATUS_DRAFT
       out = []
       out << if draft
-               "Created DRAFT invoice #{row['DisplayNumber']} for #{client['Name']}. Verified by reading it back."
+               "Created DRAFT invoice #{row['DisplayNumber']} for #{GoreloTools.client_label(client)}. Verified by reading it back."
              else
-               "⚠ Created invoice #{row['DisplayNumber']} for #{client['Name']}, but Gorelo reports it as " \
+               "⚠ Created invoice #{row['DisplayNumber']} for #{GoreloTools.client_label(client)}, but Gorelo reports it as " \
                  "#{nested(row, 'Status', 'Name').inspect}, NOT Draft. Check it in Gorelo now."
              end
+      if row['ClientId'].to_s != client['Id'].to_s
+        out << "⚠ Gorelo shows this invoice on a DIFFERENT client (#{api.client_name(row['ClientId']) || "id #{row['ClientId'].inspect}"}) " \
+               "than the one requested (#{client['Name']}). Check it in Gorelo now."
+      end
       out << "Subtotal #{money(row['SubTotal'])} · tax #{money(row['TotalTax'])} · total #{money(row['Total'])} · " \
              "dated #{row['InvoiceDate'].to_s[0, 10]} · due #{row['DueDate'].to_s[0, 10]}"
       out.concat(invoice_line_rows(Array(row['LineItems'])))

@@ -677,6 +677,17 @@ def run_suite():
     check("a client change is applied AND verified by reading back",
           "Updated:" in ok and "Verified by reading the ticket back" in ok and
           "Contoso" in ok, ok[:400])
+    TP = "/v1/tickets/00000000-0000-0000-0000-000000001000"
+    b0 = last_body(TP)
+    inact = s2.call("gorelo_update_ticket", ticket="G-1000", client="AWX", confirm=True)
+    check("update_ticket will not move a ticket to an inactive client by name",
+          'No active client matches "AWX"' in inact and "AWX Holdings is inactive" in inact
+          and "give its id (11008)" in inact and "Nothing was changed" in inact
+          and last_body(TP) == b0, (inact, last_body(TP)))
+    byid = s2.call("gorelo_update_ticket", ticket="G-1000", client="11008", confirm=True)
+    check("but by numeric id it can, and is labelled inactive",
+          "AWX Holdings (inactive)" in byid and last_body(TP).get("ClientId") == 11008, byid)
+    s2.call("gorelo_update_ticket", ticket="G-1000", client="Contoso", confirm=True)
     # G-1002 is wired to ignore StatusId, standing in for a wrong field name.
     # The API returns success and changes nothing - which must NOT read as a win.
     silent = s2.call("gorelo_update_ticket", ticket="G-1002", status="Closed", confirm=True)
@@ -780,6 +791,15 @@ def run_suite():
     check("an ambiguous client is refused, never guessed",
           "clients match" in amb and "Nothing was created" in amb, amb)
     h0 = hits(P)
+    awx = s2.call("gorelo_create_draft_invoice", client="AWX", lines=LINES, confirm=True)
+    check("a draft invoice will not be raised on an inactive client by name",
+          'No active client matches "AWX"' in awx and "give its id (11008)" in awx
+          and "Nothing was created" in awx and hits(P) == h0, (awx, h0, hits(P)))
+    awx_id = s2.call("gorelo_create_draft_invoice", client="11008", lines=LINES, confirm=True)
+    check("by numeric id it is raised, and the client is labelled inactive",
+          "Created DRAFT invoice" in awx_id and "AWX Holdings (inactive)" in awx_id
+          and hits(P) == h0 + 1, awx_id)
+    h0 = hits(P)
     bad = s2.call("gorelo_create_draft_invoice", client="Fabrikam",
                   lines=[{"item": "Managed desktop seat", "quantity": 0},
                          {"item": "Microsoft", "quantity": 1},
@@ -819,9 +839,15 @@ def run_suite():
     check("a read-back that 404s is reported loudly, and the POST is not retried",
           "could NOT be read back" in gone and "check in Gorelo before assuming it exists" in gone.replace("Check", "check")
           and "Verified" not in gone and hits(P) == h0 + 1, (gone, h0, hits(P)))
+    check("and the read-back failure carries the real error (404)", "404" in gone, gone)
     check("and a repeat of it is refused", "Refused" in
           s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
                   reference="VANISH", confirm=True))
+    h0 = hits(P)
+    moved = s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
+                    reference="WRONG-CLIENT", confirm=True)
+    check("a draft shown on a different client than requested is flagged loudly",
+          "⚠" in moved and "DIFFERENT client" in moved and hits(P) == h0 + 1, moved)
     again = s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
                     reference="MCP-TEST", confirm=True)
     check("an identical invoice within 24h is refused",

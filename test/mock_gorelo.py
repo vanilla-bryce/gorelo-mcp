@@ -337,7 +337,7 @@ WORK_TYPES = [
      "CoaCode": "200", "Tax": "GST on Income", "MinimumTimeInMinutes": 60},
     {"Id": 5, "Name": "Internal / Admin", "HourlyMultiplier": 1.0,
      "IsDefaultOutsideBusinessHours": False,
-     "BillableStatus": {"Id": 2, "Name": "Non-billable"},
+     "BillableStatus": {"Id": 3, "Name": "Non-billable"},
      "CoaCode": "", "Tax": "", "MinimumTimeInMinutes": 0},
     {"Id": 6, "Name": "Peer Assist", "HourlyMultiplier": 1.0,
      "IsDefaultOutsideBusinessHours": False,
@@ -365,8 +365,8 @@ CONTRACTS = [
          {"Id": 9010, "Name": "Offsite Backup - 2 TB", "CreatedOn": ago(300)},
          {"Id": 9011, "Name": "DR Test - annual", "CreatedOn": ago(300)},
      ]},
-    # A contract group with NO service lines: an invoice container with
-    # no Contracts under it. It invoices nothing and looks fine from outside.
+    # A contract with NO service lines: an invoice container with
+    # no service lines under it. It invoices nothing and looks fine from outside.
     {"Id": 5003, "Name": "Fabrikam Project Retainer", "Status": {"Id": 2, "Name": "Draft"},
      "ClientId": 11003, "LocationIds": [], "CreatedOn": ago(45), "UpdatedOn": ago(45),
      "Reference": "", "StartDate": "2026-10-01T00:00:00Z", "EndDate": None,
@@ -382,8 +382,8 @@ CONTRACTS = [
 ]
 
 BILLABLE = {"Id": 1, "Name": "Billable"}
-NOT_BILLABLE = {"Id": 2, "Name": "Non-billable"}
-NO_CHARGE = {"Id": 3, "Name": "No charge"}
+NOT_BILLABLE = {"Id": 3, "Name": "Non-billable"}
+NO_CHARGE = {"Id": 2, "Name": "No charge"}
 
 USER_NAMES = {ME: "Sam Rivers", OTHER: "Alex Kim"}
 
@@ -1380,7 +1380,8 @@ class Handler(BaseHTTPRequestHandler):
         total = round(subtotal + tax, 2)
         INVOICES.append({
             "Id": str(uuid.uuid4()), "Number": n, "DisplayNumber": "INV-%04d" % n,
-            "ClientId": body["ClientId"], "ContractId": None,
+            "ClientId": 11001 if body.get("Reference") == "WRONG-CLIENT" else body["ClientId"],
+            "ContractId": None,
             "Status": {"Id": status, "Name": INVOICE_STATUS_NAMES[status]},
             "InvoiceDate": date, "DueDate": (body.get("DueDate") or date)[:10],
             "SubTotal": round(subtotal, 2), "TotalDiscount": 0.0, "TotalTax": round(tax, 2),
@@ -1421,7 +1422,7 @@ if __name__ == "__main__":
     print("mock gorelo on 127.0.0.1:%d" % PORT, file=sys.stderr)
     print("  %d tickets, %d clients, %d agents, %d time entries" %
           (len(TICKETS), len(CLIENTS), len(AGENTS), len(TIME_ENTRIES)), file=sys.stderr)
-    print("  %d contract groups (UI: 'contract groups'), %d billing roles, %d work types"
+    print("  %d contracts, %d billing roles, %d work types"
           % (len(CONTRACTS), len(BILLING_ROLES), len(WORK_TYPES)), file=sys.stderr)
     print("  expected: %d unclosed led by user %d, +9 assisting, "
           "14 merged excluded, 2 unlisted-status" %

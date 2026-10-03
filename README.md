@@ -150,7 +150,7 @@ Since 3 October 2026 Gorelo lets you limit an API key **per module** to Read, Wr
 
 - **Read** on every module you want the assistant to see;
 - **Write** only on **Tickets** (comments, status and client changes), **Time entries** (only if
-  you use `gorelo_update_time_entry`), **Invoices** (drafts) and **Uptime** (maintenance);
+  you use `gorelo_update_time_entry` or `gorelo_update_time_entries`), **Invoices** (drafts) and **Uptime** (maintenance);
 - **no Delete scope on any module.**
 
 Why: this server already has no `DELETE` call anywhere, and with no Delete scope Gorelo enforces
@@ -177,7 +177,7 @@ that too, so a bug or a hijacked key still can't remove anything.
 | `gorelo_work_types` | | Multipliers and per-entry minimum times — the two fields that change an invoice without changing the hours |
 | `gorelo_list_invoices` | | Invoices by client, status, contract or date — names the ones approved but never emailed, and the overdue |
 | `gorelo_get_invoice_pdf` | | Saves an invoice PDF to a local folder. ⚠ Gorelo logs every download as an export event |
-| `gorelo_get_contract` | | One contract group in full: schedule, service lines, labour terms, line items |
+| `gorelo_get_contract` | | One contract in full: schedule, service lines, labour terms, line items |
 | `gorelo_list_items` | | The product and bundle catalogue with category, tax and margin; a bundle against its parts |
 | `gorelo_list_uptime` | | Uptime checks and their maintenance windows — names the ones that never expire |
 | `gorelo_add_ticket_comment` | **yes** | Adds a comment, optionally with files from one folder. Off by default. |
@@ -385,7 +385,7 @@ Confirmed working:
 /v1/attachments                   POST  ← since 2026-09-25, multipart. /v1/tickets/{id}/attachments
                                         is no longer in the spec
 /v1/tickets/statuses | /tags | /types
-/v1/clients
+/v1/clients                       inactive excluded by default since 2026-10-03; this server sends StatusIds=1,2
 /v1/contacts                      ClientId is SINGULAR here
 /v1/assets/agents                 ClientIds filter since 2026-08-21
 /v1/assets/custom                 since 2026-08-21
@@ -651,7 +651,7 @@ python3 test/mock_gorelo.py       # in one terminal
 python3 test/drive.py             # in another
 ```
 
-257 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
+263 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
 assisting assignees, watcher-only exclusion, closed-ticket exclusion, lookup by number,
 deleted comments, cursor pagination, rate-limit retry, every write guard, and the protocol
 edge cases (unknown method, unknown tool, malformed input). The driver sets

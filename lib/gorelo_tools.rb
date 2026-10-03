@@ -454,10 +454,38 @@ module GoreloTools
 
   # ---- 3. search clients --------------------------------------------------
 
+  # The ONE client a write may target. A name fragment matches ACTIVE clients
+  # only; an inactive client must be given by its numeric id.
+  def write_client(api, term, did)
+    term = term.to_s.strip
+    all  = api.resolve_clients(term)
+    if term.match?(/\A\d+\z/)
+      exact = all.select { |c| c['Id'].to_s == term }
+      return [exact.first, nil] if exact.size == 1
+    end
+    return [nil, "No client matches #{term.inspect}."] if all.empty?
+
+    active = all.reject { |c| client_inactive?(c) }
+    if active.empty?
+      gone = all.first
+      return [nil, "No active client matches #{term.inspect}. #{gone['Name'] || gone['CompanyName']} " \
+                   "is inactive; give its id (#{gone['Id']}) if you really mean it. Nothing was #{did}."]
+    end
+    if active.size > 1
+      return [nil, "#{active.size} clients match #{term.inspect}: " \
+                   "#{active.first(8).map { |c| "#{c['Id']} #{client_label(c)}" }.join(', ')}. Narrow it."]
+    end
+
+    [active.first, nil]
+  end
+
+  def client_inactive?(client)
+    client['IsActive'] == false || nested(client, 'Status', 'Id') == 2
+  end
+
   # A client's name, with "(inactive)" after it when Gorelo says it is.
   def client_label(client)
-    inactive = client['IsActive'] == false || nested(client, 'Status', 'Id') == 2
-    "#{client['Name'] || client['CompanyName']}#{inactive ? ' (inactive)' : ''}"
+    "#{client['Name'] || client['CompanyName']}#{client_inactive?(client) ? ' (inactive)' : ''}"
   end
 
   def search_clients(server, api)
@@ -1999,15 +2027,11 @@ module GoreloTools
       intent  = []
 
       unless args['client'].to_s.strip.empty?
-        matched = api.resolve_clients(args['client'])
-        next "No client matches #{args['client'].inspect}." if matched.empty?
-        if matched.size > 1
-          next "#{matched.size} clients match #{args['client'].inspect}: " \
-               "#{matched.first(8).map { |c| "#{c['Id']} #{c['Name']}" }.join(', ')}. Narrow it."
-        end
+        target, why = write_client(api, args['client'], 'changed')
+        next why unless target
 
-        payload['ClientId'] = matched.first['Id']
-        intent << "client #{api.client_name(t['ClientId']) || '(none)'} → #{matched.first['Name']}"
+        payload['ClientId'] = target['Id']
+        intent << "client #{api.client_name(t['ClientId']) || '(none)'} → #{client_label(target)}"
       end
 
       unless args['status'].to_s.strip.empty?
