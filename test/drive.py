@@ -425,6 +425,11 @@ def run_suite():
     check("a status filter is sent as StatusIds",
           "INV-1044" in drafts and "INV-1042" not in drafts
           and last_query("/v1/invoices").get("StatusIds") == "1", drafts[:400])
+    one = s.call("gorelo_list_invoices", number="INV-1042")
+    check("one invoice by number also shows its line items",
+          "Line items" in one and "Managed desktop seat" in one and "Backup storage block" in one
+          and "3570.00" in one, one)
+    check("a multi-invoice listing does not fetch line items", "Line items" not in inv and "Line items" not in drafts, inv[:300])
     old = s.call("gorelo_list_invoices", number="INV-0901")
     check("a number finds an invoice outside the window",
           "INV-0901" in old and "InvoiceDateSince" not in last_query("/v1/invoices"), old[:400])
@@ -784,6 +789,27 @@ def run_suite():
     check("a given unit price is sent; an omitted one is left to the item",
           "UnitPrice" not in sent_lines[0] and sent_lines[1].get("UnitPrice") == 1850, sent)
     check("the totals are Gorelo's, from the read-back", "total 2222.00" in made, made)
+    mlines = made.splitlines()
+    bi = next((n for n, l in enumerate(mlines) if "New starter bundle" in l), -1)
+    check("the read-back shows each line item with quantity, unit price and amount",
+          any("Managed desktop seat" in l and "2.00" in l and "85.00" in l and "170.00" in l
+              for l in mlines)
+          and bi >= 0 and "1850.00" in mlines[bi], made)
+    check("a bundle line shows its parts indented underneath it",
+          bi >= 0 and "Dell Latitude 5450" in mlines[bi + 1] and "Microsoft 365 Business Premium" in mlines[bi + 2]
+          and mlines[bi + 1].startswith("      ") and mlines[bi + 1].startswith(mlines[bi][:2]),
+          made)
+    check("the read-back no longer lists invoices by CreatedSince",
+          "CreatedSince" not in last_query(P), last_query(P))
+    h0 = hits(P)
+    gone = s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
+                   reference="VANISH", confirm=True)
+    check("a read-back that 404s is reported loudly, and the POST is not retried",
+          "could NOT be read back" in gone and "check in Gorelo before assuming it exists" in gone.replace("Check", "check")
+          and "Verified" not in gone and hits(P) == h0 + 1, (gone, h0, hits(P)))
+    check("and a repeat of it is refused", "Refused" in
+          s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
+                  reference="VANISH", confirm=True))
     again = s2.call("gorelo_create_draft_invoice", client="Fabrikam", lines=LINES,
                     reference="MCP-TEST", confirm=True)
     check("an identical invoice within 24h is refused",

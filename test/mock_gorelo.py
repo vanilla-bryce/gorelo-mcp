@@ -612,9 +612,20 @@ def day(d):
 INVOICE_STATUS_NAMES = {1: "Draft", 3: "Paid", 4: "Void", 5: "Approved"}
 
 
+def detail_line(n, item_name, qty, price, item_type="Product", subs=None):
+    """One LineItems[] entry as GET /v1/invoices/{id} returns it."""
+    return {"Id": "1b000000-0000-4000-8000-%012d" % n, "ItemId": None,
+            "ItemType": {"Id": 1 if item_type == "Product" else 2, "Name": item_type},
+            "Name": item_name, "Description": None, "Quantity": qty, "UnitPrice": price,
+            "UnitCost": None, "DiscountPercent": 0.0, "Tax": {"Id": 1, "Name": "GST"},
+            "TaxAmount": round(qty * price / 11, 2), "Amount": round(qty * price, 2),
+            "CoaCode": None, "BillableStatus": {"Id": 1, "Name": "Billable"},
+            "SubItems": subs or []}
+
+
 def invoice(n, client, status, date_ago, due_ago, total, paid, emailed, contract=None):
     tax = round(total / 11, 2)
-    return {"Id": "1a000000-0000-4000-8000-%012d" % n, "Number": n,
+    inv = {"Id": "1a000000-0000-4000-8000-%012d" % n, "Number": n,
             "DisplayNumber": "INV-%04d" % n, "ClientId": client, "ContractId": contract,
             "Status": {"Id": status, "Name": INVOICE_STATUS_NAMES[status]},
             "InvoiceDate": day(date_ago), "DueDate": day(due_ago),
@@ -625,6 +636,17 @@ def invoice(n, client, status, date_ago, due_ago, total, paid, emailed, contract
             "BrandingThemeId": None, "IsEmailSent": emailed,
             "EmailSentOn": ago(date_ago) if emailed else None,
             "CreatedOn": ago(date_ago), "UpdatedOn": None}
+    # Kept off the list rows (the real list has no LineItems); GET by id shows them.
+    inv["_lines"] = [detail_line(n * 10, "Managed desktop seat", 1.0, round(total - tax, 2))]
+    if n == 1042:
+        inv["_lines"] = [detail_line(n * 10, "Managed desktop seat", 42.0, 85.00),
+                         detail_line(n * 10 + 1, "Backup storage block", 1.0, round(total - tax - 3570.0, 2))]
+    return inv
+
+
+def public_invoice(i):
+    """The list shape: no LineItems, no mock-only keys."""
+    return {k: v for k, v in i.items() if not k.startswith("_")}
 
 
 INVOICES = [
@@ -1042,6 +1064,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/time-entries/statuses":
             return self.reply(404, fail(404, "No route /v1/time-entries/statuses"))
 
+        m = re.fullmatch(r"/v1/invoices/([^/]+)", path)
+        if m:
+            hit = next((i for i in INVOICES if i["Id"] == m.group(1)), None)
+            # VANISH: the invoice was created, but is not readable by id afterwards.
+            if not hit or hit.get("_vanish"):
+                return self.reply(404, fail(404, "Invoice not found"))
+            return self.reply(200, env(dict(public_invoice(hit), Description=None,
+                                            LineItems=hit["_lines"], Attachments=[])))
+
         m = re.fullmatch(r"/v1/invoices/([^/]+)/pdf", path)
         if m:
             hit = next((i for i in INVOICES if i["Id"] == m.group(1)), None)
@@ -1084,7 +1115,7 @@ class Handler(BaseHTTPRequestHandler):
                         if text in (i["DisplayNumber"] + " " + (i["Reference"] or "")).lower()]
             rows = sorted(rows, key=lambda i: i["InvoiceDate"], reverse=True)
             rows, pag = paginate(rows, q)
-            return self.reply(200, env(rows, pag))
+            return self.reply(200, env([public_invoice(i) for i in rows], pag))
 
         m = re.fullmatch(r"/v1/time-entries/(\d+)", path)
         if m:
@@ -1316,6 +1347,7 @@ class Handler(BaseHTTPRequestHandler):
         if not lines:
             return self.reply(400, fail(400, "At least one line item is required"))
         subtotal = tax = 0.0
+        detail = []
         for l in lines:
             if set(l) - self.LINE_FIELDS:
                 return self.reply(400, fail(400, "Unknown line fields: %s" % sorted(set(l) - self.LINE_FIELDS)))
@@ -1331,6 +1363,13 @@ class Handler(BaseHTTPRequestHandler):
                    else ((t or {}).get("Percentage") or 0))
             subtotal += amount
             tax += round(amount * pct / 100, 2)
+            bundle = it["Type"]["Name"] == "Bundle"
+            subs = [{"ItemId": s["ItemId"], "Name": s["Name"]}
+                    for s in ITEM_SUBITEMS.get(it["Id"], [])] if bundle else []
+            detail.append(dict(detail_line(len(INVOICES) * 100 + len(detail), it["Name"],
+                                           l["Quantity"], price, it["Type"]["Name"], subs),
+                               ItemId=it["Id"], Description=l.get("Description"),
+                               Amount=amount))
         n = max(i["Number"] for i in INVOICES) + 1
         status = body.get("StatusId") or 1
         date = (body.get("InvoiceDate") or day(0))[:10]
@@ -1346,7 +1385,8 @@ class Handler(BaseHTTPRequestHandler):
             "InvoiceTemplateId": None, "InvoiceEmailTemplateId": None, "BrandingThemeId": None,
             "IsEmailSent": False, "EmailSentOn": None,
             "CreatedOn": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "UpdatedOn": None})
+            "UpdatedOn": None, "_lines": detail,
+            "_vanish": body.get("Reference") == "VANISH"})
         # BOOM-500: the invoice IS created, then the request fails - the case
         # where retrying the POST raises a second invoice.
         if body.get("Reference") == "BOOM-500":

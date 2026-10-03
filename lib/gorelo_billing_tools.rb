@@ -114,6 +114,17 @@ module GoreloBillingTools
       rows = api.get_all('/v1/invoices', query)
       next "No invoices - #{scope.join(', ')}." if rows.empty?
 
+      # One invoice picked out by number: its line items are worth the extra
+      # request. A listing never fetches them.
+      detail_lines = nil
+      if query['Number'] && rows.size == 1
+        detail_lines = begin
+          Array(api.get("/v1/invoices/#{rows.first['Id']}").dig('Data', 'LineItems'))
+        rescue Gorelo::Error => e
+          "⚠ Line items could not be read: #{e.message}"
+        end
+      end
+
       today    = Date.today
       due_on   = ->(i) { Date.iso8601(i['DueDate'].to_s[0, 10]) rescue nil }
       approved = ->(i) { nested(i, 'Status', 'Id') == STATUS_APPROVED }
@@ -142,6 +153,13 @@ module GoreloBillingTools
       end
       out << "#{rows.size - limit} more not shown - raise limit." if rows.size > limit
 
+      if detail_lines.is_a?(String)
+        out << '' << detail_lines
+      elsif detail_lines
+        out << '' << 'Line items'
+        out.concat(invoice_line_rows(detail_lines))
+      end
+
       if unsent.any?
         out << ''
         out << "⚠ APPROVED BUT NEVER EMAILED - #{unsent.size}. Pushed to accounting, never sent to the client:"
@@ -162,6 +180,20 @@ module GoreloBillingTools
         out << "  … #{overdue.size - FLAG_LIST_MAX} more" if overdue.size > FLAG_LIST_MAX
       end
       out.join("\n")
+    end
+  end
+
+  # Line items as GET /v1/invoices/{id} returns them: name, quantity, unit price
+  # and amount, with a bundle's parts (SubItems) indented underneath it. Used by
+  # gorelo_list_invoices (one invoice by number) and the draft read-back.
+  def invoice_line_rows(items)
+    return ['  (no line items)'] if items.empty?
+
+    items.flat_map do |l|
+      row = "  #{format('%7.2f', l['Quantity'].to_f)} x #{pad(l['Name'], 36)}" \
+            "#{money(l['UnitPrice']).rjust(10)}#{money(l['Amount']).rjust(12)}"
+      subs = Array(l['SubItems']).map { |s| "      · #{s['Name']}" }
+      [row] + subs
     end
   end
 
@@ -688,8 +720,6 @@ module GoreloBillingTools
              'last 24 hours. Nothing was created. Change the reference if a second one is really wanted.'
       end
 
-      # Matching is by Id, so a wide window costs nothing and survives clock skew.
-      before = Time.now.utc - 86_400
       begin
         id = api.post('/v1/invoices', payload).dig('Data', 'Id')
       rescue Gorelo::AmbiguousWrite => e
@@ -702,15 +732,14 @@ module GoreloBillingTools
       end
       api.record_write(key, "POST /v1/invoices #{client['Name']} → #{id}")
 
-      # There is no GET /v1/invoices/{id}, so the new invoice is found by listing
-      # this client's invoices created since just before the POST.
+      # Read back by id. A failed read is reported, never retried: the POST has
+      # already succeeded and must not be repeated on the strength of it.
       row = begin
-        api.get_all('/v1/invoices', { 'ClientIds' => client['Id'], 'CreatedSince' => before.iso8601 })
-           .find { |i| i['Id'].to_s == id.to_s }
+        api.get("/v1/invoices/#{id}")['Data']
       rescue Gorelo::Error
         nil
       end
-      unless row
+      unless row.is_a?(Hash)
         next "⚠ Gorelo returned invoice id #{id} for #{client['Name']}, but it could NOT be read back. " \
              'Check in Gorelo before assuming it exists, or raising it again.'
       end
@@ -725,11 +754,7 @@ module GoreloBillingTools
              end
       out << "Subtotal #{money(row['SubTotal'])} · tax #{money(row['TotalTax'])} · total #{money(row['Total'])} · " \
              "dated #{row['InvoiceDate'].to_s[0, 10]} · due #{row['DueDate'].to_s[0, 10]}"
-      lines.each do |l|
-        price = l[:unit_price].nil? ? l[:item]['UnitPrice'] : l[:unit_price]
-        out << "  #{format('%7.2f', l[:quantity])} x #{pad(l[:item]['Name'], 36)}#{money(price).rjust(10)}" \
-               "#{l[:unit_price].nil? ? '' : '  (price given)'}"
-      end
+      out.concat(invoice_line_rows(Array(row['LineItems'])))
       out << 'Not approved, not emailed, not sent to accounting. Review and approve it in Gorelo.' if draft
       out.join("\n")
     end
