@@ -201,6 +201,13 @@ def run_suite():
     two_terms = s.call("gorelo_search_clients", term="adventure,awx")
     check("comma-separated client terms are OR-ed",
           "Adventure Works" in two_terms and "AWX Holdings" in two_terms)
+    awx = s.call("gorelo_search_clients", term="AWX")
+    check("an inactive client is found, and marked (inactive)",
+          "AWX Holdings (inactive)" in awx and "Adventure Works (inactive)" not in two_terms, awx)
+    check("clients are fetched with StatusIds including 2 (inactive)",
+          "2" in last_query("/v1/clients").get("StatusIds", "").split(","), last_query("/v1/clients"))
+    check("get_client marks an inactive client too",
+          "AWX Holdings (inactive)" in s.call("gorelo_get_client", client="AWX", include_devices=False))
 
     print("\nticket lookup (no API support for number or search)")
     open_one = s.call("gorelo_get_ticket", ticket="G-1000")

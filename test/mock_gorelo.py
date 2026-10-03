@@ -1003,7 +1003,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, env(rows, pag))
 
         if path == "/v1/clients":
-            rows, pag = paginate(CLIENTS, q)
+            # Since 3 Oct 2026 inactive clients are EXCLUDED unless StatusIds
+            # asks for them (1 = active, 2 = inactive).
+            want = q_ids(q, "StatusIds") or {"1"}
+            rows = [c for c in CLIENTS if ("1" if c["IsActive"] else "2") in want]
+            rows, pag = paginate(rows, q)
             return self.reply(200, env(rows, pag))
 
         # --- the 2026-09-04 release ------------------------------------

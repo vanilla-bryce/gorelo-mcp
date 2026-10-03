@@ -264,7 +264,10 @@ module Gorelo
     end
 
     def clients
-      @cache[:clients] ||= get_all('/v1/clients')
+      # Since 3 Oct 2026 GET /v1/clients leaves out inactive clients unless
+      # StatusIds asks for them (1 = active, 2 = inactive). Without 2, a ticket
+      # for an inactive client has no name to resolve to.
+      @cache[:clients] ||= get_all('/v1/clients', { 'StatusIds' => '1,2' })
     end
 
     def contracts

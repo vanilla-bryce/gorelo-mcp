@@ -454,6 +454,12 @@ module GoreloTools
 
   # ---- 3. search clients --------------------------------------------------
 
+  # A client's name, with "(inactive)" after it when Gorelo says it is.
+  def client_label(client)
+    inactive = client['IsActive'] == false || nested(client, 'Status', 'Id') == 2
+    "#{client['Name'] || client['CompanyName']}#{inactive ? ' (inactive)' : ''}"
+  end
+
   def search_clients(server, api)
     server.tool(
       name:  'gorelo_search_clients',
@@ -482,7 +488,7 @@ module GoreloTools
       out << "#{pad('Id', 8)}#{pad('Name', 42)}Status"
       out << ('-' * 68)
       matched.first(limit).each do |c|
-        out << "#{pad(c['Id'], 8)}#{pad(c['Name'] || c['CompanyName'], 42)}" \
+        out << "#{pad(c['Id'], 8)}#{pad(client_label(c), 42)}" \
                "#{c['IsActive'].nil? ? (nested(c, 'Status', 'Name') || '') : (c['IsActive'] ? 'Active' : 'Inactive')}"
       end
       out << "#{matched.size - limit} more not shown." if matched.size > limit
@@ -513,7 +519,7 @@ module GoreloTools
 
       ids = matched.map { |c| c['Id'] }
       out = []
-      matched.each { |c| out << "#{c['Id']}  #{c['Name'] || c['CompanyName']}" }
+      matched.each { |c| out << "#{c['Id']}  #{client_label(c)}" }
       out << ('=' * 78)
 
       # Braces are required. Ruby 3 hands a brace-less trailing hash to the
