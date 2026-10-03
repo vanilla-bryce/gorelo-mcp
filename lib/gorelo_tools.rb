@@ -765,7 +765,7 @@ module GoreloTools
       min_days = (args['min_days'] || 0).to_i
 
       ids = if wanted == 'solved'
-              api.statuses.values.select { |st| st['BaseStatusId'] == Gorelo::BASE_SOLVED }
+              api.statuses.values.select { |st| Gorelo.base_of(st) == Gorelo::BASE_SOLVED }
             else
               api.statuses.values.select { |st| st['Name'].to_s.downcase.include?(wanted) }
             end

@@ -172,6 +172,12 @@ def run_suite():
           "Waiting Vendor" in everything and "did not list" in everything)
     check("assisting assignees counted", "9 as assisting assignee" in everything)
 
+    base_line = next((l for l in everything.splitlines() if l.startswith("Breakdown by base status")), "")
+    check("statuses in the new BaseStatus {Id, Name} shape are understood (Gorelo, 3 Oct 2026)",
+          "Closed" in base_line and "Open" in base_line, base_line)
+    active = s.call("gorelo_list_tickets", status="active", limit=300)
+    check("a status still in the old BaseStatusId shape is understood too",
+          "Quote Required" in active, active[:600])
     watch = s.call("gorelo_list_tickets", status="open", limit=300)
     check("watcher-only ticket excluded", "Watching only" not in watch)
     check("closed-assist tickets excluded", "Closed assist" not in watch)

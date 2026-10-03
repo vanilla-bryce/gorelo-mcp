@@ -79,6 +79,17 @@ module Gorelo
 
   ACTIVE_BASES = [BASE_NEW, BASE_OPEN, BASE_ON_HOLD].freeze
 
+  # The base a status belongs to. Gorelo's 3 October 2026 release replaced
+  # BaseStatusId with BaseStatus {Id, Name}. A renamed field does not error -
+  # it just stops appearing, and every ticket's base silently became unknown,
+  # so "open" started returning closed tickets. Both shapes are read, and this
+  # is the only place that reads either.
+  def self.base_of(status)
+    return nil unless status.is_a?(Hash)
+
+    status.dig('BaseStatus', 'Id') || status['BaseStatusId']
+  end
+
   BASE_NAMES = {
     BASE_NEW => 'New', BASE_OPEN => 'Open', BASE_SOLVED => 'Solved-base',
     BASE_CLOSED => 'Closed', BASE_ON_HOLD => 'On Hold'
@@ -219,7 +230,7 @@ module Gorelo
     end
 
     def base_status_id(status_id)
-      statuses.dig(status_id.to_s, 'BaseStatusId')
+      Gorelo.base_of(statuses[status_id.to_s])
     end
 
     # Every status except the closed base, built from the live status list so a
@@ -231,7 +242,7 @@ module Gorelo
     # tickets, because a server-side status filter cannot return a status it
     # has never heard of (Merged, id 5, is exactly that).
     def unclosed_status_ids
-      statuses.values.reject { |s| s['BaseStatusId'] == BASE_CLOSED }.map { |s| s['Id'] }
+      statuses.values.reject { |s| Gorelo.base_of(s) == BASE_CLOSED }.map { |s| s['Id'] }
     end
 
     GUID = /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i

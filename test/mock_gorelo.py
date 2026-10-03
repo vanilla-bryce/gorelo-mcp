@@ -75,17 +75,21 @@ def ago(days, hours=0):
 # Deliberately does NOT include id 5 "Merged" (real Gorelo omits it) and does
 # NOT include id 364 "Waiting Vendor" (stands in for any status an instance has
 # that this endpoint fails to return). Both must still be handled correctly.
+# Since Gorelo's 3 October 2026 release a status carries BaseStatus {Id, Name};
+# before it, a bare BaseStatusId. A renamed field does not error - it just
+# stops appearing - so "Quote Required" is deliberately left in the OLD shape
+# to prove the server reads both.
 STATUSES = [
-    {"Id": 1,   "Name": "New",              "BaseStatusId": 1, "AskForReason": False},
-    {"Id": 2,   "Name": "Open",             "BaseStatusId": 2, "AskForReason": False},
-    {"Id": 3,   "Name": "Solved",           "BaseStatusId": 3, "AskForReason": False},
-    {"Id": 4,   "Name": "Closed",           "BaseStatusId": 4, "AskForReason": False},
-    {"Id": 6,   "Name": "On Hold",          "BaseStatusId": 6, "AskForReason": True},
-    {"Id": 362, "Name": "Scheduled",        "BaseStatusId": 2, "AskForReason": True},
-    {"Id": 363, "Name": "Waiting Client",   "BaseStatusId": 6, "AskForReason": True},
+    {"Id": 1,   "Name": "New",              "BaseStatus": {"Id": 1, "Name": "New"}, "AskForReason": False},
+    {"Id": 2,   "Name": "Open",             "BaseStatus": {"Id": 2, "Name": "Open"}, "AskForReason": False},
+    {"Id": 3,   "Name": "Solved",           "BaseStatus": {"Id": 3, "Name": "Solved"}, "AskForReason": False},
+    {"Id": 4,   "Name": "Closed",           "BaseStatus": {"Id": 4, "Name": "Closed"}, "AskForReason": False},
+    {"Id": 6,   "Name": "On Hold",          "BaseStatus": {"Id": 6, "Name": "OnHold"}, "AskForReason": True},
+    {"Id": 362, "Name": "Scheduled",        "BaseStatus": {"Id": 2, "Name": "Open"}, "AskForReason": True},
+    {"Id": 363, "Name": "Waiting Client",   "BaseStatus": {"Id": 6, "Name": "OnHold"}, "AskForReason": True},
     {"Id": 798, "Name": "Quote Required",   "BaseStatusId": 2, "AskForReason": False},
-    {"Id": 799, "Name": "Standing Ticket",  "BaseStatusId": 3, "AskForReason": False},
-    {"Id": 807, "Name": "Billing",          "BaseStatusId": 3, "AskForReason": True},
+    {"Id": 799, "Name": "Standing Ticket",  "BaseStatus": {"Id": 3, "Name": "Solved"}, "AskForReason": False},
+    {"Id": 807, "Name": "Billing",          "BaseStatus": {"Id": 3, "Name": "Solved"}, "AskForReason": True},
 ]
 UNLISTED_MERGED = {"Id": 5, "Name": "Merged"}
 UNLISTED_OTHER = {"Id": 364, "Name": "Waiting Vendor"}
