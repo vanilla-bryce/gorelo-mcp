@@ -292,6 +292,13 @@ neither read nor selected.
 
 #### `gorelo_create_draft_invoice`
 
+> **⚠ Paused since 3 October 2026.** Gorelo's `POST /v1/invoices` gives an API-created invoice
+> the next number but does not advance the sequence, so the next invoice Gorelo raises itself
+> reuses it. Seen on a live tenant: an API-created draft took **42110998** on 26 Sept and the
+> recurring run issued **42110998** again on 29 Sept, to a different client - the only repeated
+> number in 1,017 invoices. The tool now refuses every call, before any lookup, unless
+> `GORELO_ALLOW_INVOICE_CREATE=true`. Set that only once Gorelo has fixed the numbering.
+
 Raises a manual invoice against one client, **always as a Draft**. `StatusId` is hard-coded to
 `1` and there is no parameter to change it: approving an invoice pushes it to Xero/QuickBooks,
 and that stays a person's decision, made in Gorelo.
@@ -655,7 +662,7 @@ python3 test/mock_gorelo.py       # in one terminal
 python3 test/drive.py             # in another
 ```
 
-266 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
+267 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
 assisting assignees, watcher-only exclusion, closed-ticket exclusion, lookup by number,
 deleted comments, cursor pagination, rate-limit retry, every write guard, and the protocol
 edge cases (unknown method, unknown tool, malformed input). The driver sets

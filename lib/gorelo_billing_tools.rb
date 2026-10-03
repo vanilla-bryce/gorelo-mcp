@@ -618,11 +618,32 @@ module GoreloBillingTools
     )
   end
 
+  # PAUSED (2026-10-03). Gorelo's POST /v1/invoices hands out the next invoice
+  # number without advancing the sequence, so the next invoice Gorelo raises
+  # itself reuses it. Seen live: an API-created draft took 42110998 on
+  # 2026-09-26 and the recurring run issued 42110998 again on 2026-09-29, to a
+  # different client - the only repeated number in 1,017 invoices. Until Gorelo
+  # fixes it, every API-created invoice would plant a duplicate number in the
+  # client's inbox and the accounting system. Re-enable with
+  # GORELO_ALLOW_INVOICE_CREATE=true once it is fixed, then delete this guard.
+  def invoice_creation_paused? = ENV['GORELO_ALLOW_INVOICE_CREATE'].to_s.downcase != 'true'
+
+  INVOICE_PAUSE_MESSAGE =
+    'PAUSED: invoice creation is turned off. Gorelo\'s POST /v1/invoices does not advance the ' \
+    'invoice-number sequence, so the next invoice Gorelo raises reuses the number (seen live: ' \
+    '42110998 issued twice, 2026-09-26 and 2026-09-29, to two clients). Nothing was created. ' \
+    'Raise the invoice in Gorelo directly; set GORELO_ALLOW_INVOICE_CREATE=true only once ' \
+    'Gorelo has fixed the numbering.'
+
   def create_draft_invoice(server, api)
     server.tool(
       name:  'gorelo_create_draft_invoice',
       title: 'Raise a DRAFT invoice in Gorelo',
       description: <<~TEXT,
+        ⚠ PAUSED by default since 2026-10-03: Gorelo's API reuses invoice numbers for invoices it
+        creates, so every call is refused unless GORELO_ALLOW_INVOICE_CREATE=true. Raise invoices
+        in Gorelo directly until that is fixed.
+
         Raises a manual invoice against one client, ALWAYS AS A DRAFT. A person approves it in
         Gorelo; approving is what pushes it to Xero/QuickBooks, and that is never done here.
 
@@ -666,6 +687,8 @@ module GoreloBillingTools
         additionalProperties: false
       }
     ) do |args|
+      # First, before anything else: a paused tool must not even look up the client.
+      next INVOICE_PAUSE_MESSAGE if invoice_creation_paused?
       next 'Writes are disabled. Set GORELO_ALLOW_WRITES=true in .env and restart.' unless api.writes_allowed?
       next 'Refused: confirm must be true. Nothing was created.' unless args['confirm'] == true
 

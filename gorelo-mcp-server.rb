@@ -67,6 +67,8 @@ server = McpStdio::Server.new(
     Group" for a contract and "Contract" for a service line; mention that only if the user
     is looking at one of those.
 
+    gorelo_create_draft_invoice is PAUSED (Gorelo's API reuses invoice numbers for invoices it
+    creates); raise invoices in Gorelo directly until GORELO_ALLOW_INVOICE_CREATE=true is set.
     INVOICES created here are ALWAYS Drafts; approving one pushes it to the accounting
     system and is left to a person in Gorelo. Downloading an invoice PDF is recorded by
     Gorelo as an export event on that invoice, so do not download one just to read it.

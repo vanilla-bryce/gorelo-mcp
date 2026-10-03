@@ -33,6 +33,9 @@ ENV.update({
     "GORELO_MY_EMAIL": "sam@example.com",
     "GORELO_ALLOW_WRITES": os.environ.get("WRITES", "false"),
     "GORELO_READ_TIMEOUT": "3",
+    # Invoice creation is paused by default (Gorelo numbering bug, Oct 2026);
+    # the suite opts in so the tool's own guards stay tested.
+    "GORELO_ALLOW_INVOICE_CREATE": "true",
     "HOME": os.path.join(HERE, "_tmp_home"),
     "GORELO_DOWNLOAD_DIR": os.path.join(HERE, "_tmp_home", "downloads"),
     "GORELO_ATTACH_DIR": os.path.join(HERE, "_tmp_home", "gorelo-attachments"),
@@ -791,6 +794,15 @@ def run_suite():
     check("and it can be ended again", "Ended maintenance" in restored, restored)
 
     print("\ndraft invoices")
+    ENV.pop("GORELO_ALLOW_INVOICE_CREATE")
+    sp = Server()
+    h0 = hits("/v1/invoices")
+    paused = sp.call("gorelo_create_draft_invoice", client="Fabrikam",
+                     lines=[{"item": "Managed desktop seat", "quantity": 1}], confirm=True)
+    sp.close()
+    ENV["GORELO_ALLOW_INVOICE_CREATE"] = "true"
+    check("invoice creation is PAUSED by default - refused with the reason, nothing sent",
+          "PAUSED" in paused and "42110998" in paused and hits("/v1/invoices") == h0, paused)
     P = "/v1/invoices"
     LINES = [{"item": "Managed desktop seat", "quantity": 2},
              {"item": "New starter bundle", "quantity": 1, "unit_price": 1850}]
