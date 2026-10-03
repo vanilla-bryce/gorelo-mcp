@@ -62,10 +62,10 @@ server = McpStdio::Server.new(
     were before. Whether an hour can be invoiced is decided by the entry's own
     BillableStatus; never re-derive it from the work type or the contract.
 
-    CONTRACTS, and the wording is inverted from Gorelo's own web UI. An API "contract"
-    (gorelo_list_contracts) is what the UI calls a CONTRACT GROUP - the invoice - and an
-    API "ServiceLine" is what the UI calls a CONTRACT. Say both when reporting one, or
-    the user will compare it to their screen and conclude the data is wrong.
+    CONTRACTS: since 3 Oct 2026 the API and Gorelo's web UI use the same words - a contract
+    (gorelo_list_contracts) holds service lines. Older screens and exports said "Contract
+    Group" for a contract and "Contract" for a service line; mention that only if the user
+    is looking at one of those.
 
     INVOICES created here are ALWAYS Drafts; approving one pushes it to the accounting
     system and is left to a person in Gorelo. Downloading an invoice PDF is recorded by

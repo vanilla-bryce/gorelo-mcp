@@ -23,10 +23,10 @@ leaves your computer.
 > it to anyone, it needs revisiting.** Details:
 > [what changed on 4 September 2026](#the-4-september-2026-release).
 >
-> One more thing that release makes unavoidable: in the API a **`contract` is what
-> Gorelo's web UI calls a "Contract Group"**, and a **`ServiceLine` is what the UI calls a
-> "Contract"**. The words are inverted. See
-> [contracts are inverted](#contracts-the-api-and-the-ui-use-the-same-words-for-different-things).
+> One more thing from that release: until 3 October 2026 a **`contract` was what Gorelo's
+> web UI called a "Contract Group"**, and a **`ServiceLine` was what the UI called a
+> "Contract"**. That was true then; the UI now uses the API's words. See
+> [contract naming](#contracts-the-api-and-the-ui-now-use-the-same-words).
 
 ---
 
@@ -159,7 +159,7 @@ Restart your MCP client. Then ask it something like *"list my open Gorelo ticket
 | `gorelo_time_report` | | Recorded vs invoiceable vs billable hours, and realisation, by technician or client — from real per-entry data, so per-person totals are exact |
 | `gorelo_list_time_entries` | | The individual entries behind a total: who, when, comment, work type, billing role, service line |
 | `gorelo_response_report` | | First-response times — median, 90th, worst, share within target. Costs no extra requests |
-| `gorelo_list_contracts` | | Contract **groups** (what the UI calls contracts' parent invoice) with their service lines, recurring amount, cost and margin |
+| `gorelo_list_contracts` | | Contracts with their service lines, recurring amount, cost and margin |
 | `gorelo_billing_roles` | | The sell-rate table — what an hour is worth under each role |
 | `gorelo_work_types` | | Multipliers and per-entry minimum times — the two fields that change an invoice without changing the hours |
 | `gorelo_list_invoices` | | Invoices by client, status, contract or date — names the ones approved but never emailed, and the overdue |
@@ -217,7 +217,7 @@ argument is refused rather than ignored.
 - `work_type` is a name or id matched against the live work types (`"Peer Assist"`).
   `billable_status` is Billable, Non-billable, No charge or Void: there is no endpoint that
   lists them, so the four values seen on real entries are built in.
-- `service_line_id` is the API ServiceLine, which the UI calls a Contract.
+- `service_line_id` is the API ServiceLine (older UI screens called it a Contract).
 - The batch tool refuses the whole batch if any entry is invalid, applies entries about one per
   second and stops at the first error, reporting what was and was not applied.
 - Every applied change is written to `~/.gorelo-mcp-writes.jsonl`.
@@ -402,7 +402,7 @@ appeared, all returning HTTP 200 with the usual
 | Endpoint | Paginated | What it holds |
 |---|---|---|
 | `GET /v1/time-entries` | yes, cursor | One row per logged entry, **tenant-wide** |
-| `GET /v1/contracts` | yes, cursor | Recurring agreements — *the UI calls these Contract Groups* |
+| `GET /v1/contracts` | yes, cursor | Recurring agreements (older UI screens: Contract Groups) |
 | `GET /v1/billing-roles` | no | `Id`, `Name`, `HourlyRate`, `CoaCode`, `Tax` |
 | `GET /v1/work-types` | no | `Id`, `Name`, `HourlyMultiplier`, `IsDefaultOutsideBusinessHours`, `BillableStatus`, `CoaCode`, `Tax`, `MinimumTimeInMinutes` |
 
@@ -471,22 +471,20 @@ A fourth wrinkle sits in `gorelo_list_items` rather than the API itself: when a 
 has no cost or price, the tool prints the bundle's sum-of-parts as **"unknown"** rather than
 silently counting the missing part as zero, which would understate the total without saying so.
 
-### Contracts: the API and the UI use the same words for different things
+### Contracts: the API and the UI now use the same words
 
-**They are inverted, and it will make correct data look wrong.**
+Until 3 October 2026 the UI used different words from the API for the same objects:
 
-| In the API | In Gorelo's web UI |
-|---|---|
-| a `contract` (`/v1/contracts`) | a **Contract Group** — the invoice |
-| a `ServiceLine` inside it | a **Contract** |
+| In the API | In Gorelo's web UI until 3 Oct 2026 | Now |
+|---|---|---|
+| a `contract` (`/v1/contracts`) | a **Contract Group** — the invoice | **Contract** |
+| a `ServiceLine` inside it | a **Contract** | **Service line** |
 
-So one API contract is a billing container holding several UI contracts. Gorelo has said
-it intends to **align the UI to the API** eventually, which means the words will swap
-rather than the confusion disappearing. `gorelo_list_contracts` prints both vocabularies on
-every run for exactly that reason, and `gorelo_list_time_entries` labels an entry's
-`ServiceLine` as *"service line (UI: contract)"*.
+That mismatch was real and made correct data look wrong, which is why the tools used to print
+both vocabularies. It is gone: the UI was renamed to match the API. The contract tools now
+print a single line saying so, for anyone holding an old screenshot or export.
 
-A contract group with **no service lines** is flagged: it is an invoice container with
+A contract with **no service lines** is flagged: it is an invoice container with
 nothing on it, and from outside it looks identical to a healthy one.
 
 ### The 2026-08-21 release

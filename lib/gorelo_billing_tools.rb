@@ -62,7 +62,7 @@ module GoreloBillingTools
         properties: {
           client:   { type: 'string', description: 'Client name fragment or id. Comma-separate several.' },
           status:   { type: 'string', enum: %w[all draft approved paid void], description: 'Default "all".' },
-          contract: { type: 'integer', description: 'Contract group id (an API "contract") the invoices were raised from.' },
+          contract: { type: 'integer', description: 'Contract id the invoices were raised from.' },
           days:     { type: 'integer', description: 'Window on invoice date, in days. Default 90. Ignored when number is given.' },
           emailed:  { type: 'boolean', description: 'true: only invoices emailed to the client. false: only ones never emailed.' },
           number:   { type: 'string', description: 'One invoice by number, e.g. INV-1042 or 1042.' },
@@ -103,7 +103,7 @@ module GoreloBillingTools
 
       if args['contract']
         query['ContractIds'] = args['contract'].to_i
-        scope << "contract group #{args['contract'].to_i}"
+        scope << "contract #{args['contract'].to_i}"
       end
 
       unless args['emailed'].nil?
@@ -243,18 +243,18 @@ module GoreloBillingTools
 
   # ---- contract detail ----------------------------------------------------
 
-  # A contract group by numeric id, or by a name fragment that matches exactly
+  # A contract by numeric id, or by a name fragment that matches exactly
   # one. An ambiguous fragment is refused with the candidates.
   def find_contract(api, ref)
     ref = ref.to_s.strip
-    return [nil, 'Give a contract group id or a fragment of its name.'] if ref.empty?
+    return [nil, 'Give a contract id or a fragment of its name.'] if ref.empty?
     return [ref.to_i, nil] if ref.match?(/\A\d+\z/)
 
     needle = ref.downcase
     hits = api.contracts.select { |c| c['Name'].to_s.downcase.include?(needle) }
-    return [nil, "No contract group name contains #{ref.inspect} (#{api.contracts.size} exist)."] if hits.empty?
+    return [nil, "No contract name contains #{ref.inspect} (#{api.contracts.size} exist)."] if hits.empty?
     if hits.size > 1
-      return [nil, "#{hits.size} contract groups match #{ref.inspect}: " \
+      return [nil, "#{hits.size} contracts match #{ref.inspect}: " \
                    "#{hits.first(10).map { |c| "#{c['Id']} #{c['Name']}" }.join(', ')}. Give the id."]
     end
 
@@ -264,14 +264,14 @@ module GoreloBillingTools
   def get_contract(server, api)
     server.tool(
       name:  'gorelo_get_contract',
-      title: 'Show one Gorelo contract group in full',
+      title: 'Show one Gorelo contract in full',
       description: <<~TEXT,
-        Everything about one contract group: client, term, invoice schedule, contacts,
+        Everything about one contract: client, term, invoice schedule, contacts,
         recurring amount/cost/margin, and each service line with its labour terms and the line
         items it actually bills.
 
-        ⚠ THE TERMINOLOGY IS INVERTED. This is one /v1/contracts record, which Gorelo's web UI
-        calls a CONTRACT GROUP. Each service line under it is what the UI calls a CONTRACT.
+        This is one /v1/contracts record (a contract); each service line under it is a
+        ServiceLine. The API and Gorelo's web UI use the same words since 3 Oct 2026.
 
         Flagged: automatic approve-and-send (invoices go out with nobody reviewing them),
         block-hours balances at or under their warning threshold, and service lines with no
@@ -280,7 +280,7 @@ module GoreloBillingTools
       input_schema: {
         type: 'object',
         properties: {
-          contract: { type: 'string', description: 'Contract group id, or a fragment of its name.' }
+          contract: { type: 'string', description: 'Contract id, or a fragment of its name.' }
         },
         required: ['contract'],
         additionalProperties: false
@@ -294,9 +294,8 @@ module GoreloBillingTools
       term  = [c['StartDate'], c['EndDate']].map { |d| d.to_s[0, 10] }
       days  = c['DaysBeforeInvoiceCreation']
 
-      out = ["Contract group #{c['Id']} - #{c['Name']}"]
-      out << 'API "contract" = UI "Contract Group" (this record). ' \
-             'API "ServiceLine" = UI "Contract" (each line below).'
+      out = ["Contract #{c['Id']} - #{c['Name']}"]
+      out << GoreloTools::RENAME_NOTE
       out << "Client: #{nested(c, 'Client', 'Name')} · #{nested(c, 'Status', 'Name')} · " \
              "#{nested(c, 'RepeatPeriod', 'Name')} · #{term[0].empty? ? '?' : term[0]} → " \
              "#{term[1].empty? ? 'open' : term[1]}" \
@@ -309,7 +308,7 @@ module GoreloBillingTools
       out << "Recurring: bills #{money(c['RecurringAmount'])} · cost #{money(c['RecurringCost'])} · " \
              "margin #{money(c['RecurringAmount'].to_f - c['RecurringCost'].to_f)} per period"
       if c['AutoApproveAndSend']
-        flags << 'AUTO APPROVE AND SEND is on - invoices from this contract group are approved ' \
+        flags << 'AUTO APPROVE AND SEND is on - invoices from this contract are approved ' \
                  'and emailed with nobody reviewing them.'
       end
 
@@ -336,7 +335,7 @@ module GoreloBillingTools
         wt = Array(l['WorkTypes']).map { |x| x['Name'] }
         wr = Array(l['WorkRoles']).map { |x| x['Name'] }
         out << ''
-        out << "↳ Service line #{l['Id']} - #{l['Name']}  (UI: contract)"
+        out << "↳ Service line #{l['Id']} - #{l['Name']}"
         out << "   Labour: #{([nested(l, 'LaborTerms', 'Name') || '(no labour terms)'] + detail).join(' · ')}"
         out << "   Work types: #{wt.empty? ? '(any)' : wt.join(', ')} · roles: #{wr.empty? ? '(any)' : wr.join(', ')}"
         out << "   Bills #{money(l['RecurringAmount'])} · cost #{money(l['RecurringCost'])} per period"

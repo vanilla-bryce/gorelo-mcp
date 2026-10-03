@@ -1372,6 +1372,10 @@ module GoreloTools
   CONVERSATION_PUBLIC  = 1
   CONVERSATION_PRIVATE = 2
 
+  # Printed once per contract-related tool output, for people holding old
+  # screenshots or exports.
+  RENAME_NOTE = 'Gorelo renamed these on 3 Oct 2026: a contract was a "Contract Group" and a service line was a "Contract" on older screens and exports.'
+
   # Body is HTML. Plain text with newlines would render as one run-on blob,
   # and any < or & in it would be swallowed or corrupt the markup.
   def to_html(text)
@@ -1541,43 +1545,33 @@ module GoreloTools
 
   # ---- 12. contracts ------------------------------------------------------
   #
-  # READ THIS BEFORE READING A ROW. Gorelo's API and Gorelo's web UI use the
-  # same two words for different objects, and they are INVERTED:
-  #
-  #     API /v1/contracts   ->  the UI calls this a CONTRACT GROUP (the invoice)
-  #     API ServiceLines[]  ->  the UI calls each of these a CONTRACT
-  #
-  # So one API "contract" is a billing container holding several UI
-  # "contracts". Gorelo has said it intends to align the UI to the API
-  # eventually, which means this mapping will flip rather than disappear.
-  # Until then, anyone comparing this output against their own Gorelo screen
-  # will conclude the data is wrong unless both words appear together - so
-  # both words appear on every run.
+  # Until 3 Oct 2026 the web UI called an API /v1/contracts record a "Contract
+  # Group" and each of its ServiceLines[] a "Contract". The UI now uses the
+  # API's words. Older screens and exports still show the old names, so the
+  # output carries one line (RENAME_NOTE) saying so.
   def list_contracts(server, api)
     server.tool(
       name:  'gorelo_list_contracts',
-      title: 'List Gorelo contract groups and their service lines',
+      title: 'List Gorelo contracts and their service lines',
       description: <<~TEXT,
         Recurring agreements: what each one invoices, what it costs, over what period, for
         which client - with its service lines underneath.
 
-        ⚠ THE TERMINOLOGY IS INVERTED BETWEEN THE API AND THE UI, and this tool speaks API.
-        One row here is a /v1/contracts record, which Gorelo's web UI calls a CONTRACT GROUP
-        (an invoice). Each indented line under it is a ServiceLine, which the UI calls a
-        CONTRACT. If you compare a row to your Gorelo screen without holding that in mind,
-        correct data will look wrong. Gorelo says the UI will eventually be aligned to the
-        API, so expect the words to swap rather than settle.
+        One row here is a /v1/contracts record (a contract); each indented line under it is a
+        service line. The API and Gorelo's web UI use the same words since 3 Oct 2026 (older
+        screens and exports called a contract a "Contract Group" and a service line a
+        "Contract").
 
-        RecurringAmount is what the group bills each period and RecurringCost what it costs,
-        so the gap is the margin - printed per row and totalled. A group with NO service lines
-        is flagged: it is an invoice container with nothing on it.
+        RecurringAmount is what the contract bills each period and RecurringCost what it costs,
+        so the gap is the margin - printed per row and totalled. A contract with NO service
+        lines is flagged: it is an invoice container with nothing on it.
       TEXT
       input_schema: {
         type: 'object',
         properties: {
           client:   { type: 'string', description: 'Client name fragment or id. Comma-separate several terms.' },
           status:   { type: 'string', description: 'Status NAME fragment, e.g. "active". Matched locally, so a status this tool has never heard of still works.' },
-          include_service_lines: { type: 'boolean', description: 'Show each contract group\'s service lines (what the UI calls contracts) underneath it. Default true.' },
+          include_service_lines: { type: 'boolean', description: 'Show each contract\'s service lines underneath it. Default true.' },
           limit:    { type: 'integer', description: 'Default 50.' }
         },
         additionalProperties: false
@@ -1604,19 +1598,18 @@ module GoreloTools
       end
 
       if rows.empty?
-        next "No contract groups match#{scope.empty? ? '' : " (#{scope.join(', ')})"}. " \
-             "#{all.size} contract group(s) in Gorelo."
+        next "No contracts match#{scope.empty? ? '' : " (#{scope.join(', ')})"}. " \
+             "#{all.size} contract(s) in Gorelo."
       end
 
       show  = args.fetch('include_service_lines', true)
       shown = rows.sort_by { |c| -(c['RecurringAmount'].to_f) }.first(limit)
 
-      out = ["#{rows.size} of #{all.size} contract group(s)" \
+      out = ["#{rows.size} of #{all.size} contract(s)" \
              "#{scope.empty? ? '' : " (#{scope.join(', ')})"}."]
-      out << 'API "contract" = UI "Contract Group" (the invoice). ' \
-             'API "ServiceLine" = UI "Contract" (the ↳ lines).'
+      out << RENAME_NOTE
       out << ''
-      out << "#{pad('Id', 8)}#{pad('Contract group', 34)}#{pad('Client', 26)}#{pad('Status', 12)}" \
+      out << "#{pad('Id', 8)}#{pad('Contract', 34)}#{pad('Client', 26)}#{pad('Status', 12)}" \
              "#{pad('Period', 11)}#{'Bills'.rjust(11)}#{'Cost'.rjust(11)}#{'Margin'.rjust(11)}  Lines"
       out << ('-' * 128)
 
@@ -1642,7 +1635,7 @@ module GoreloTools
 
         if lines.empty?
           out << "#{' ' * 8}⚠ NO SERVICE LINES - an invoice container with nothing on it. " \
-                 'In the UI this is a Contract Group with no Contracts.'
+                 'Nothing is billed through it.'
         elsif show
           lines.each do |l|
             out << "#{' ' * 8}↳ #{pad(l['Id'], 8)}#{clip(l['Name'], 96)}"
@@ -1777,8 +1770,7 @@ module GoreloTools
         aggregates, and aggregation destroys precisely what an argument needs - the comment,
         the work type that priced the entry, and the service line it was billed against.
 
-        ⚠ SERVICE LINE is API wording. Gorelo's web UI calls a service line a CONTRACT, and
-        calls the /v1/contracts record that holds it a CONTRACT GROUP. See
+        SERVICE LINE is the ServiceLine of the /v1/contracts record that holds it. See
         gorelo_list_contracts.
 
         Every filter is sent to the API (StartedSince, TicketIds, UserIds, ClientIds), so a
@@ -1869,12 +1861,13 @@ module GoreloTools
         detail = []
         detail << clip(nested(e, 'Ticket', 'Title'), 60)
         line = nested(e, 'ServiceLine', 'Name')
-        detail << "service line (UI: contract) #{line}" unless line.to_s.strip.empty?
+        detail << "service line #{line}" unless line.to_s.strip.empty?
         comment = e['Comment'].to_s.strip
         detail << comment unless comment.empty?
         out << "#{' ' * 4}↳ #{clip(detail.join(' · '), 108)}"
       end
       out << "#{rows.size - limit} more not shown - raise limit." if rows.size > limit
+      out << RENAME_NOTE if rows.first(limit).any? { |e| !nested(e, 'ServiceLine', 'Name').to_s.strip.empty? }
       out.join("\n")
     end
   end

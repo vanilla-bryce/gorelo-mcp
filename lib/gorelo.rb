@@ -14,11 +14,10 @@
 #   - the 2026-09-04 release added /v1/time-entries, /v1/contracts,
 #     /v1/billing-roles and /v1/work-types. The first two paginate the same
 #     way; the last two are small unpaginated reference tables.
-#   - CONTRACT TERMINOLOGY IS INVERTED between the API and the web UI. An API
-#     `contract` is what the UI calls a "Contract Group" (the invoice), and an
-#     API `ServiceLine` is what the UI calls a "Contract". Gorelo has said it
-#     will align the UI to the API eventually. Until then, never print one
-#     word without the other.
+#   - Contract terminology: until 3 Oct 2026 the web UI called an API `contract`
+#     a "Contract Group" and an API `ServiceLine` a "Contract". The UI now uses
+#     the API's words (contract, service line). Older screens and exports still
+#     show the old names, so the contract tools print one line saying so.
 
 require 'net/http'
 require 'openssl'

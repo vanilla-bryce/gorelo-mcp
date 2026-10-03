@@ -118,7 +118,7 @@ module GoreloTimeEntryTools
   def service_line_name(api, id)
     api.get_all('/v1/contracts').each do |c|
       Array(c['ServiceLines']).each do |sl|
-        return "#{sl['Name']} (in contract group #{c['Name']})" if sl['Id'].to_s == id.to_s
+        return "#{sl['Name']} (in contract #{c['Name']})" if sl['Id'].to_s == id.to_s
       end
     end
     nil
@@ -194,7 +194,7 @@ module GoreloTimeEntryTools
         name = service_line_name(api, sid)
         cur  = nested(entry, 'ServiceLine', 'Name')
         lines << "service line    #{cur ? "#{cur} (#{nested(entry, 'ServiceLine', 'Id')})" : '(none)'} → " \
-                 "#{sid}#{name ? " #{name}" : ' (not found in any contract group listing; Gorelo will validate it)'}"
+                 "#{sid}#{name ? " #{name}" : ' (not found in any contract listing; Gorelo will validate it)'}"
       end
     end
 
@@ -318,7 +318,7 @@ module GoreloTimeEntryTools
   FIELD_PROPERTIES = {
     work_type:       { type: 'string', description: 'Work type name or id, e.g. "Peer Assist". Matched against gorelo_work_types.' },
     billable_status: { type: 'string', description: 'Billable, Non-billable, No charge or Void (or 1, 3, 2, 5).' },
-    service_line_id: { type: 'integer', description: 'ServiceLine id (the UI calls it a Contract). See gorelo_list_contracts.' },
+    service_line_id: { type: 'integer', description: 'ServiceLine id (a service line). See gorelo_list_contracts.' },
     comment:         { type: 'string', description: 'REPLACES the comment. Sent as given.' },
     append_comment:  { type: 'string', description: 'Adds a line after the existing comment.' }
   }.freeze
@@ -331,7 +331,7 @@ module GoreloTimeEntryTools
       title: 'Recode one Gorelo time entry',
       description: <<~TEXT,
         Change how ONE time entry is billed: its work type, billable status, service line
-        (the UI calls it a Contract) or comment. Nothing else is writable - not hours,
+        or comment. Nothing else is writable - not hours,
         dates, technician, billing role or ticket - and any other argument is refused.
 
         WITHOUT confirm: true this only PREVIEWS. It reads the entry and shows the ticket,

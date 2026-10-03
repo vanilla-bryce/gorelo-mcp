@@ -27,8 +27,8 @@ break things:
     it received is readable at /__debug/time-entries-query
   * AdjustedHours on a time entry is NULL when no rounding applied, and the
     billed duration is then ActualHours - not zero
-  * an API `contract` is what the web UI calls a "Contract Group", and its
-    `ServiceLines` are what the UI calls "Contracts" - inverted, on purpose
+  * an API `contract` holds `ServiceLines` (the web UI used other names until
+    3 Oct 2026; it now matches)
 
 Run it:  python3 mock_gorelo.py        (listens on 127.0.0.1:8899)
 """
@@ -307,10 +307,8 @@ for _t in TICKETS:
 # --- the 2026-09-04 release ----------------------------------------------
 # /v1/time-entries, /v1/contracts, /v1/billing-roles and /v1/work-types.
 #
-# TERMINOLOGY, and it is inverted from Gorelo's own web UI: a /v1/contracts
-# record is what the UI calls a CONTRACT GROUP (the invoice), and each of its
-# ServiceLines is what the UI calls a CONTRACT. The fixtures below are named
-# the API way, because that is what a client of this API actually receives.
+# TERMINOLOGY: a /v1/contracts record holds ServiceLines. (Until 3 Oct 2026 the
+# UI called them a "Contract Group" and "Contracts"; it now uses the API's words.)
 
 BILLING_ROLES = [
     {"Id": 1, "Name": "Service Desk Engineer", "HourlyRate": 165.00,
@@ -367,7 +365,7 @@ CONTRACTS = [
          {"Id": 9010, "Name": "Offsite Backup - 2 TB", "CreatedOn": ago(300)},
          {"Id": 9011, "Name": "DR Test - annual", "CreatedOn": ago(300)},
      ]},
-    # A contract group with NO service lines: in the UI, a Contract Group with
+    # A contract group with NO service lines: an invoice container with
     # no Contracts under it. It invoices nothing and looks fine from outside.
     {"Id": 5003, "Name": "Fabrikam Project Retainer", "Status": {"Id": 2, "Name": "Draft"},
      "ClientId": 11003, "LocationIds": [], "CreatedOn": ago(45), "UpdatedOn": ago(45),

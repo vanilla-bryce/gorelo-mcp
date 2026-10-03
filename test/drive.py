@@ -318,16 +318,16 @@ def run_suite():
     check("an entry cap is stated loudly, not silently applied",
           "were NOT included" in capped, capped[-300:])
 
-    print("\ncontracts - API 'contract' is the UI's 'Contract Group'")
+    print("\ncontracts - API and UI now use the same words")
+    RENAME_NOTE = 'Gorelo renamed these on 3 Oct 2026: a contract was a "Contract Group" and a service line was a "Contract" on older screens and exports.'
     ct = s.call("gorelo_list_contracts")
-    check("the API/UI terminology inversion is stated on every run",
-          'API "contract" = UI "Contract Group"' in ct
-          and 'API "ServiceLine" = UI "Contract"' in ct, ct[:400])
-    check("service lines are listed under their contract group",
+    check("the 3 Oct rename is stated once, not per row",
+          ct.count(RENAME_NOTE) == 1 and "INVERTED" not in ct and "UI:" not in ct, ct[:400])
+    check("service lines are listed under their contract",
           "Managed Desktop - 42 seats" in ct and "Backup Monitoring" in ct, ct[:900])
     check("recurring amount, cost and margin are shown and totalled",
           "27140.00" in ct and "16440.00" in ct and "10700.00" in ct, ct[-300:])
-    check("a contract group with no service lines is flagged, not shown as normal",
+    check("a contract with no service lines is flagged, not shown as normal",
           "NO SERVICE LINES" in ct, ct[:1200])
     one = s.call("gorelo_list_contracts", client="Contoso")
     check("contracts filter by client",
@@ -359,8 +359,9 @@ def run_suite():
     check("hours are per entry, not a per-ticket total",
           "1.75h  2.00h" in te and "0.50h  0.60h" in te, te[:1000])
     check("the technician's own comment survives", "Assisted with the mailbox" in te, te[:1000])
-    check("service line is labelled with the UI's word for it too",
-          "service line (UI: contract)" in te, te[:1000])
+    check("service line is plain, with the rename note once",
+          "service line (UI: contract)" not in te and "service line Managed Desktop" in te
+          and te.count(RENAME_NOTE) == 1, te[:1000])
     check("a ticket filter is sent as TicketIds", "TicketIds" in te_query(), te_query())
     mine = s.call("gorelo_list_time_entries", ticket="G-1000", user="alex", days=30)
     check("a per-user filter works on a ticket led by somebody else",
@@ -462,8 +463,8 @@ def run_suite():
 
     print("\ncontract detail")
     cd = s.call("gorelo_get_contract", contract="5001")
-    check("both vocabularies are printed",
-          'UI "Contract Group"' in cd and "(UI: contract)" in cd, cd[:400])
+    check("the rename note is printed once, plain naming otherwise",
+          cd.count(RENAME_NOTE) == 1 and "INVERTED" not in cd and "(UI: contract)" not in cd, cd[:400])
     check("line items are listed per service line",
           "Managed desktop seat" in cd and "3570.00" in cd, cd)
     check("automatic approve-and-send is flagged", "AUTO APPROVE AND SEND" in cd, cd[-900:])
@@ -472,12 +473,16 @@ def run_suite():
     check("a service line with no line items is flagged",
           "NO LINE ITEMS on service line 9003" in cd, cd[-900:])
     by_name = s.call("gorelo_get_contract", contract="contoso")
-    check("a unique name fragment resolves", "Contract group 5002" in by_name, by_name[:200])
+    check("a unique name fragment resolves", "Contract 5002" in by_name, by_name[:200])
     amb = s.call("gorelo_get_contract", contract="a")
     check("an ambiguous fragment lists candidates instead of guessing",
-          "Give the id" in amb and "Contract group" not in amb, amb)
+          "Give the id" in amb and "Contract 5" not in amb, amb)
     miss = s.call("gorelo_get_contract", contract="99999")
     check("an unknown id surfaces the 404", "404" in miss, miss)
+    check("no tool description or contract output says INVERTED",
+          not any("INVERTED" in t.get("description", "").upper() for t in tools)
+          and not any("INVERTED" in x.upper() for x in (ct, cd, te, by_name, amb, miss)),
+          [t["name"] for t in tools if "INVERTED" in t.get("description", "").upper()])
 
     print("\nitem catalogue")
     it = s.call("gorelo_list_items")
