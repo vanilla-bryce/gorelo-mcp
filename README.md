@@ -136,12 +136,25 @@ Restart your MCP client. Then ask it something like *"list my open Gorelo ticket
 
 | Variable | |
 |---|---|
-| `GORELO_API_KEY` | **Required.** Make it read-only to start with — only six tools write. |
+| `GORELO_API_KEY` | **Required.** Make it read-only to start with — only six tools write. See [key scopes](#api-key-scopes) below. |
 | `GORELO_MY_EMAIL` | **Required** for `assignee: "me"`. Must match your Gorelo user exactly. |
 | `GORELO_BASE_URL` | Defaults to `https://api.aue.gorelo.io`. Change for other regions. |
 | `GORELO_ALLOW_WRITES` | `true` enables the six write tools. Off by default. |
 | `GORELO_DOWNLOAD_DIR` | Where `gorelo_get_invoice_pdf` saves PDFs. Defaults to `~/gorelo-invoices`. |
 | `GORELO_ATTACH_DIR` | The **only** folder comment attachments can come from. Defaults to `~/gorelo-attachments`. |
+
+#### API key scopes
+
+Since 3 October 2026 Gorelo lets you limit an API key **per module** to Read, Write or Delete
+(existing keys keep full access). Create this server's key with:
+
+- **Read** on every module you want the assistant to see;
+- **Write** only on **Tickets** (comments, status and client changes), **Time entries** (only if
+  you use `gorelo_update_time_entry`), **Invoices** (drafts) and **Uptime** (maintenance);
+- **no Delete scope on any module.**
+
+Why: this server already has no `DELETE` call anywhere, and with no Delete scope Gorelo enforces
+that too, so a bug or a hijacked key still can't remove anything.
 
 ---
 
@@ -290,9 +303,10 @@ and that stays a person's decision, made in Gorelo.
   the item.
 - An identical invoice within 24 hours is refused, using the same fingerprint log as comments.
   The fingerprint is taken over normalised values, so `2` and `2.0` are the same quantity.
-- The POST returns only an id and there is no `GET /v1/invoices/{id}`, so the tool lists that
-  client's invoices created in the last day and finds the id — then reports the
-  number, status and totals as Gorelo computed them.
+- The POST returns only an id, so the tool reads the invoice back with `GET /v1/invoices/{id}`
+  (new on 3 October 2026; before that it had to list the client's recent invoices) — then
+  reports the number, status, totals and line items as Gorelo computed them, with a bundle's
+  parts indented under it. If that read fails it says so loudly and does not retry.
 
 **A POST whose outcome is unknown is never retried** — for invoices, comments and uploads
 alike. That covers a 5xx, a read timeout, a connection dropped or reset after the body went
@@ -378,10 +392,11 @@ Confirmed working:
 /v1/organization/users
 /v1/time-entries                  GET   ← since 2026-09-04. Tenant-wide, cursor-paginated.
                                         Filters documented 2026-09-25 - see below
-/v1/contracts                     GET   ← since 2026-09-04. "Contract GROUPS" in the UI
+/v1/contracts                     GET   ← since 2026-09-04. (a "Contract Group" on UI screens before 3 Oct)
 /v1/billing-roles                 GET   ← since 2026-09-04. Small, unpaginated
 /v1/work-types                    GET   ← since 2026-09-04. Small, unpaginated
 /v1/invoices                      GET, POST   ← since 2026-09-25. POST used for Drafts only
+/v1/invoices/{id}                 GET   ← since 2026-10-03. Line items (bundle parts in SubItems) and attachments
 /v1/invoices/{id}/pdf             GET   ← since 2026-09-25. A file, not the envelope
 /v1/contracts/{id}                GET   ← since 2026-09-25. Service lines with line items
 /v1/items | /{id} | /categories   GET   ← since 2026-09-25
@@ -470,6 +485,36 @@ about them are easy to miss:
 A fourth wrinkle sits in `gorelo_list_items` rather than the API itself: when a bundle's part
 has no cost or price, the tool prints the bundle's sum-of-parts as **"unknown"** rather than
 silently counting the missing part as zero, which would understate the total without saying so.
+
+### The 3 October 2026 release
+
+**One of these broke things silently; the rest are renames and new capabilities.**
+
+- **`BaseStatusId` became `BaseStatus {Id, Name}`.** A ticket's status class is now an object.
+  This server read the old field, got nothing, and so could no longer tell closed tickets from
+  open ones: "open" returned closed tickets as well — **664 against 78 live**. Fixed in
+  `8445efa`, which reads `BaseStatus.Id`. This is the same failure shape as the 2026-08-21
+  renames: nothing errors, the numbers are just wrong.
+- **The web UI was renamed to match the API.** Contract Group → **Contract**, Contract →
+  **Service line**, Contract Type → **Labor terms**, Per Hour → **Hourly**, Automatically
+  Covered → **Coverage**. The API's own words did not change. See
+  [the contracts note](#contracts-the-api-and-the-ui-now-use-the-same-words).
+- **`GET /v1/invoices/{invoiceId}` exists.** It returns the invoice plus `LineItems[]` (a
+  bundle is one line with its parts in `SubItems`) and `Attachments[]`. `gorelo_create_draft_invoice`
+  now reads the new draft back with it, and `gorelo_list_invoices` with `number` shows the line
+  items. The old "list the client's recent invoices" read-back is gone.
+- **`GET /v1/clients` excludes inactive clients by default.** `StatusIds=1,2` returns both
+  (173 active + 3 inactive = 176 on the tenant checked). The server now always asks for both,
+  so an inactive client's tickets still have a name, and marks such clients `(inactive)`.
+- **Time-entry billable status names changed:** `Billable`, `No charge`, `Non-billable` (were
+  `Billable`, `No Charge`, `Not Billable`). The server decides billable by the status name
+  *starting with* "billable", so `Non-billable` is correctly not billable; the suite pins that.
+- **API keys can be limited per module** to Read, Write or Delete — see
+  [key scopes](#api-key-scopes).
+- **Contract dates are now calendar dates** rather than timestamps. No code change was needed:
+  the server already shows only the first ten characters.
+- **`ClientId` / `LocationId` are `null` instead of `-1`** for unassigned agents and uptime
+  checks. No code change was needed.
 
 ### Contracts: the API and the UI now use the same words
 
@@ -606,7 +651,7 @@ python3 test/mock_gorelo.py       # in one terminal
 python3 test/drive.py             # in another
 ```
 
-207 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
+257 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
 assisting assignees, watcher-only exclusion, closed-ticket exclusion, lookup by number,
 deleted comments, cursor pagination, rate-limit retry, every write guard, and the protocol
 edge cases (unknown method, unknown tool, malformed input). The driver sets

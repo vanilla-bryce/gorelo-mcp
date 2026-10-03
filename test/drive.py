@@ -277,7 +277,12 @@ def run_suite():
     check("both technicians appear, so assisting time is not booked to the lead",
           "Sam Rivers" in tr and "Alex Kim" in tr, tr[:900])
     check("every BillableStatus is shown with its hours, not just the billable one",
-          "No Charge" in tr and "Not Billable" in tr and "counted billable" in tr, tr[:1400])
+          "No charge" in tr and "Non-billable" in tr and "counted billable" in tr, tr[:1400])
+    status_rows = {l.split("  ")[0].strip(): l for l in tr.splitlines() if "to invoice" in l and "entr(ies)" in l}
+    check("Non-billable is NOT counted billable, though the word contains 'billable'",
+          "Non-billable" in status_rows and status_rows["Non-billable"].rstrip().endswith("not billable")
+          and "counted billable" not in status_rows["Non-billable"]
+          and status_rows["Billable"].rstrip().endswith("counted billable"), status_rows)
     check("realisation is adjusted/actual, with the billable share as its own column",
           "Real." in tr and "Bill%" in tr, tr[:1200])
     check("non-billable hours are itemised, not just percentaged",

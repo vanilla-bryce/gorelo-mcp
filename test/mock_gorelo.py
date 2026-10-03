@@ -337,7 +337,7 @@ WORK_TYPES = [
      "CoaCode": "200", "Tax": "GST on Income", "MinimumTimeInMinutes": 60},
     {"Id": 5, "Name": "Internal / Admin", "HourlyMultiplier": 1.0,
      "IsDefaultOutsideBusinessHours": False,
-     "BillableStatus": {"Id": 2, "Name": "Not Billable"},
+     "BillableStatus": {"Id": 2, "Name": "Non-billable"},
      "CoaCode": "", "Tax": "", "MinimumTimeInMinutes": 0},
     {"Id": 6, "Name": "Peer Assist", "HourlyMultiplier": 1.0,
      "IsDefaultOutsideBusinessHours": False,
@@ -382,8 +382,8 @@ CONTRACTS = [
 ]
 
 BILLABLE = {"Id": 1, "Name": "Billable"}
-NOT_BILLABLE = {"Id": 2, "Name": "Not Billable"}
-NO_CHARGE = {"Id": 3, "Name": "No Charge"}
+NOT_BILLABLE = {"Id": 2, "Name": "Non-billable"}
+NO_CHARGE = {"Id": 3, "Name": "No charge"}
 
 USER_NAMES = {ME: "Sam Rivers", OTHER: "Alex Kim"}
 
