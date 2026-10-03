@@ -475,6 +475,15 @@ def run_suite():
               "No invoice numbered 7777" in s.call("gorelo_get_invoice_pdf", invoice="INV-7777"))
     finally:
         debug("honour-filters")
+    shared = s.call("gorelo_get_invoice_pdf", invoice="INV-1041")
+    check("a number two invoices share is refused, listing both - never the first",
+          "2 invoices are numbered 1041" in shared and "Northwind" in shared
+          and "Proseware" in shared and "Saved" not in shared, shared)
+    check("and either one can then be downloaded by its id", "Saved" in
+          s.call("gorelo_get_invoice_pdf", invoice="1a000000-0000-4000-8000-100000001041"))
+    listed = s.call("gorelo_list_invoices", number="INV-1041")
+    check("listing a shared number shows both and says numbers are not unique",
+          listed.count("INV-1041") >= 2 and "not unique" in listed, listed[:600])
     gone = s.call("gorelo_get_invoice_pdf", invoice="00000000-0000-4000-8000-000000000000")
     check("an unknown id surfaces Gorelo's 404, not an empty file", "404" in gone, gone)
 

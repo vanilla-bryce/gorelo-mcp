@@ -474,6 +474,10 @@ The same release added invoices, the item catalogue, taxes, full contract detail
 checks and a general attachment upload, and the tools above use all of them. Three things
 about them are easy to miss:
 
+- **Invoice numbers are not unique.** On the live tenant one number belonged to two
+  clients' invoices. `gorelo_get_invoice_pdf` refuses a number that matches more than one
+  invoice and lists each with its id and client; download by id. `gorelo_list_invoices`
+  shows every match and says so.
 - **Downloading an invoice PDF is not a pure read.** Gorelo records each download against the
   invoice as an export event.
 - **`PageSize` outside 1–200 is a 400** on `/v1/invoices`, `/v1/items` and `/v1/uptime`, not
@@ -651,7 +655,7 @@ python3 test/mock_gorelo.py       # in one terminal
 python3 test/drive.py             # in another
 ```
 
-263 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
+266 assertions covering the cases that have actually broken: merged tickets, unlisted statuses,
 assisting assignees, watcher-only exclusion, closed-ticket exclusion, lookup by number,
 deleted comments, cursor pagination, rate-limit retry, every write guard, and the protocol
 edge cases (unknown method, unknown tool, malformed input). The driver sets

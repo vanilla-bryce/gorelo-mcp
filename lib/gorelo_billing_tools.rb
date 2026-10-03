@@ -153,6 +153,16 @@ module GoreloBillingTools
       end
       out << "#{rows.size - limit} more not shown - raise limit." if rows.size > limit
 
+      if query['Number'] && rows.size > 1
+        out << ''
+        out << "⚠ #{rows.size} invoices share number #{query['Number']} - Gorelo's invoice numbers are " \
+               'not unique. Use the invoice id to pick one (gorelo_get_invoice_pdf takes it).'
+        rows.first(limit).each do |i|
+          out << "  #{i['Id']}  #{pad(api.client_name(i['ClientId']) || "client #{i['ClientId']}", 26)}" \
+                 "#{nested(i, 'Status', 'Name')}"
+        end
+      end
+
       if detail_lines.is_a?(String)
         out << '' << detail_lines
       elsif detail_lines
@@ -211,10 +221,22 @@ module GoreloBillingTools
     return [nil, "#{ref.inspect} is not an invoice number or id."] unless num.match?(/\A\d+\z/)
 
     # Matched exactly rather than taking the first row: the API ignores a
-    # filter it does not honour, and would then return every invoice.
-    row = Array(api.get('/v1/invoices', { 'Number' => num.to_i })['Data'])
-          .find { |i| i['Number'].to_s == num.to_i.to_s }
-    row ? [row, nil] : [nil, "No invoice numbered #{num.to_i}."]
+    # filter it does not honour, and would then return every invoice. And
+    # every match is kept, because Gorelo does NOT keep invoice numbers
+    # unique - on the live tenant one number belonged to two clients'
+    # invoices. Taking the first would download (and log an export event
+    # against) whichever one the API happened to list first.
+    rows = Array(api.get('/v1/invoices', { 'Number' => num.to_i })['Data'])
+           .select { |i| i['Number'].to_s == num.to_i.to_s }
+    return [nil, "No invoice numbered #{num.to_i}."] if rows.empty?
+    return [rows.first, nil] if rows.size == 1
+
+    [nil, "#{rows.size} invoices are numbered #{num.to_i} - Gorelo does not keep invoice numbers " \
+          "unique. Nothing was downloaded. Give the id of the one you mean:\n" +
+          rows.map do |i|
+            "  #{i['Id']}  #{api.client_name(i['ClientId']) || "client #{i['ClientId']}"} · " \
+              "#{nested(i, 'Status', 'Name')} · #{i['InvoiceDate'].to_s[0, 10]} · total #{money(i['Total'])}"
+          end.join("\n")]
   end
 
   def get_invoice_pdf(server, api)

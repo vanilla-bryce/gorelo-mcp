@@ -657,6 +657,12 @@ INVOICES = [
     invoice(1044, 11003, 1, 30, 20, 990.00, 0.00, False),            # draft past its due date: NOT overdue
     invoice(1045, 11004, 4, 12, -2, 13200.00, 0.00, True, 5004),     # void
 ]
+# Gorelo does NOT keep invoice numbers unique: on the live tenant (3 Oct 2026)
+# one number belonged to two clients' invoices. So a second INV-1041, on
+# another client, with its own Id.
+_dup = invoice(1041, 11005, 3, 35, 21, 440.00, 440.00, True)
+_dup["Id"] = "1a000000-0000-4000-8000-100000001041"
+INVOICES.append(_dup)
 
 
 # --- item catalogue (Gorelo, 25 Sep 2026) ---------------------------------
